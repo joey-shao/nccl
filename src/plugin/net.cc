@@ -42,7 +42,7 @@ getNcclCollNet_t* getNcclCollNet[NCCL_NET_VERSION_COUNT] = {getNcclCollNet_v11, 
 #define NCCL_GIN_VERSION_COUNT 1
 getNcclGin_t* getNcclGin[NCCL_GIN_VERSION_COUNT] = {getNcclGin_v11};
 
-#define NCCL_NET_NUM_INTERNAL_PLUGINS 2
+#define NCCL_NET_NUM_INTERNAL_PLUGINS 3
 
 typedef enum ncclNetPluginState {
   ncclNetPluginStateDisabled        = -2,       // Plugin library failed to initialize
@@ -333,6 +333,8 @@ static void initPluginLibsOnceFunc() {
   netPluginLibs[pluginCounter].ncclGinPluginState = netPluginLibs[pluginCounter].ncclGin ? ncclNetPluginStateInitReady : ncclNetPluginStateLoadFailed;
   ++pluginCounter;
   netPluginLibs[pluginCounter].ncclNet = &ncclNetSocket;
+  netPluginLibs[pluginCounter++].ncclNetPluginState = ncclNetPluginStateInitReady;
+  netPluginLibs[pluginCounter].ncclNet = &ncclNetDpdkSocket;
   netPluginLibs[pluginCounter++].ncclNetPluginState = ncclNetPluginStateInitReady;
   pluginCount = pluginCounter;
 }
