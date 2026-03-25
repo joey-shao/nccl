@@ -3,10 +3,11 @@
 #
 # See LICENSE.txt for license information
 #
-.PHONY: all clean
+.PHONY: all clean nettest
 
 default: src.build
 install: src.install
+nettest: src.nettest
 BUILDDIR ?= $(abspath ./build)
 ABSBUILDDIR := $(abspath $(BUILDDIR))
 TARGETS := src pkg

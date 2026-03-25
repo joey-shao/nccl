@@ -29,11 +29,35 @@ LIBSRCFILES := \
 	$(filter-out ras/client.cc,$(wildcard ras/*.cc))
 BINSRCFILES := ras/client.cc
 
+NETTESTFILES := $(wildcard transport/net_plugin_test/*.cc) 
+
+NETTEST_IMPL ?= socket
+DPDK_CFLAGS ?= $(shell pkg-config --cflags libdpdk 2>/dev/null)
+DPDK_LIBS   ?= $(shell pkg-config --libs libdpdk 2>/dev/null)
+
+ifeq ($(NETTEST_IMPL),dpdk)
+NETTESTSRCFILES := $(NETTESTFILES) transport/net_dpdk.cc transport/ncdp.cc misc/socket.cc
+NETTESTCXXFLAGS := -DNETTEST_USE_DPDK $(DPDK_CFLAGS)
+NETTESTLDFLAGS := $(DPDK_LIBS)
+ifneq ($(strip $(DPDK_CFLAGS) $(DPDK_LIBS)),)
+# DPDK flags are provided via pkg-config or user overrides.
+else
+$(warning NETTEST_IMPL=dpdk but DPDK flags are empty. Set DPDK_CFLAGS/DPDK_LIBS if build fails.)
+endif
+else ifeq ($(NETTEST_IMPL),socket)
+NETTESTSRCFILES := $(NETTESTFILES) transport/net_socket.cc misc/socket.cc
+NETTESTCXXFLAGS :=
+NETTESTLDFLAGS :=
+else
+$(error Unsupported NETTEST_IMPL='$(NETTEST_IMPL)'. Use NETTEST_IMPL=socket or NETTEST_IMPL=dpdk)
+endif
+
 ##### lib files
 LIBNAME     := libnccl.so
 STATICLIBNAME := libnccl_static.a
 ##### binaries
 BINNAME := ncclras
+NETTESTBINNAME := ncclnettest
 ##### pkgconfig files
 PKGCONFIGFILE := nccl.pc
 ##### dirs
@@ -52,6 +76,9 @@ ifeq ($(CUDARTLIB), cudart_static)
 	LIBSRCFILES += enhcompat.cc
 endif
 
+# Keep transport net integration test sources out of libnccl.so objects.
+LIBSRCFILES := $(filter-out $(NETTESTFILES) ,$(LIBSRCFILES))
+
 INCTARGETS := $(INCEXPORTS:%=$(INCDIR)/%)
 LIBSONAME  := $(LIBNAME:%=%.$(NCCL_MAJOR))
 LIBTARGET  := $(LIBNAME:%=%.$(NCCL_MAJOR).$(NCCL_MINOR).$(NCCL_PATCH))
@@ -59,7 +86,8 @@ STATICLIBTARGET := $(STATICLIBNAME)
 PKGTARGET  := $(PKGCONFIGFILE)
 LIBOBJ     := $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
 BINOBJ     := $(BINSRCFILES:%.cc=$(OBJDIR)/%.o)
-DEPFILES   := $(LIBOBJ:%.o=%.d) $(BINOBJ:%.o=%.d)
+NETTESTOBJ := $(NETTESTSRCFILES:%.cc=$(OBJDIR)/%.o)
+DEPFILES   := $(LIBOBJ:%.o=%.d) $(BINOBJ:%.o=%.d) $(NETTESTOBJ:%.o=%.d)
 LDFLAGS    += -L${CUDA_LIB} -l$(CUDARTLIB) -lpthread -lrt -ldl
 INCPLUGIN  := include/plugin
 
@@ -84,6 +112,8 @@ lib : $(INCTARGETS) $(LIBDIR)/$(LIBTARGET) $(PKGDIR)/$(PKGTARGET)
 staticlib : $(LIBDIR)/$(STATICLIBTARGET)
 
 binary : $(BINDIR)/$(BINNAME)
+
+nettest : $(BINDIR)/$(NETTESTBINNAME)
 
 $(DEVMANIFEST): ALWAYS_REBUILD $(INCTARGETS)
 	$(MAKE) -C ./device
@@ -122,6 +152,13 @@ $(BINDIR)/$(BINNAME): $(BINOBJ)
 	@printf "Linking    %-35s > %s\n" $(BINNAME) $@
 	mkdir -p $(BINDIR)
 	$(CXX) $(CXXFLAGS) $^ -o $@
+
+$(BINDIR)/$(NETTESTBINNAME): $(NETTESTOBJ)
+	@printf "Linking    %-35s > %s\n" $(NETTESTBINNAME) $@
+	mkdir -p $(BINDIR)
+	$(CXX) $(CXXFLAGS) $(NETTESTOBJ) $(LDFLAGS) $(NETTESTLDFLAGS) -o $@
+
+$(NETTESTOBJ): CXXFLAGS += $(NETTESTCXXFLAGS)
 
 $(PKGDIR)/nccl.pc : nccl.pc.in
 	mkdir -p $(PKGDIR)
