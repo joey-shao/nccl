@@ -8,7 +8,6 @@
 
 #include <netinet/in.h>
 #include <rte_byteorder.h>
-#include <rte_ethdev.h>
 #include <rte_ether.h>
 #include <rte_ip.h>
 #include <rte_mbuf.h>
@@ -16,28 +15,14 @@
 #include <string.h>
 
 #define NCDP_MAGIC 0x4e434450U // "NCDP"
-#define NCDP_RX_BURST 32
-
-typedef struct __attribute__((packed)) ncdpWireHdr {
-  uint32_t magic;
-  uint16_t flags;
-  uint16_t reserved0;
-  uint32_t dstCommId;
-  uint32_t srcCommId;
-  uint32_t reqId;
-  uint32_t taskId;
-  uint32_t seq;
-  uint16_t len;
-  uint16_t reserved2;
-} ncdpWireHdr;
 
 int ncdpComputeMaxPayload(int mtu) {
   int payload = mtu - (int)sizeof(struct rte_ipv4_hdr) -
-                (int)sizeof(struct rte_udp_hdr) - (int)sizeof(ncdpWireHdr);
+                (int)sizeof(struct rte_udp_hdr) - (int)sizeof(ncdpHdr);
   int maxMbufPayload =
       (int)RTE_MBUF_DEFAULT_BUF_SIZE - (int)sizeof(struct rte_ether_hdr) -
       (int)sizeof(struct rte_ipv4_hdr) - (int)sizeof(struct rte_udp_hdr) -
-      (int)sizeof(ncdpWireHdr);
+      (int)sizeof(ncdpHdr);
   if (payload > maxMbufPayload)
     payload = maxMbufPayload;
   if (payload < 64)
@@ -45,28 +30,29 @@ int ncdpComputeMaxPayload(int mtu) {
   return payload;
 }
 
-bool ncdpTrySendFrame(const ncdpEndpoint *ep, uint16_t flags,
-                      uint32_t dstCommId, uint32_t srcCommId, uint32_t reqId,
-                      uint32_t taskId, uint32_t seq, const void *payload,
-                      uint16_t len, uint16_t udpPort) {
-  if (ep == NULL || ep->pool == NULL)
+bool ncdpBuildPacket(struct rte_mbuf *mbuf,
+                     const struct rte_ether_addr *localMac,
+                     const struct rte_ether_addr *remoteMac, uint32_t localIp,
+                     uint32_t remoteIp, uint16_t flags,
+                     uint32_t dstCommId, uint32_t srcCommId,
+                     uint32_t srcReqId, uint32_t dstReqId, uint32_t taskId,
+                     uint32_t seq, const void *payload, uint16_t len,
+                     uint16_t udpPort) {
+  if (mbuf == NULL || localMac == NULL || remoteMac == NULL)
     return false;
-  struct rte_mbuf *mbuf = rte_pktmbuf_alloc(ep->pool);
-  if (!mbuf)
-    return false;
+  rte_pktmbuf_reset(mbuf);
 
-  size_t l4Len = sizeof(struct rte_udp_hdr) + sizeof(ncdpWireHdr) + len;
+  size_t l4Len = sizeof(struct rte_udp_hdr) + sizeof(ncdpHdr) + len;
   size_t l3Len = sizeof(struct rte_ipv4_hdr) + l4Len;
   size_t total = sizeof(struct rte_ether_hdr) + l3Len;
   char *data = (char *)rte_pktmbuf_append(mbuf, total);
   if (!data) {
-    rte_pktmbuf_free(mbuf);
     return false;
   }
 
   struct rte_ether_hdr *eth = (struct rte_ether_hdr *)data;
-  rte_ether_addr_copy(&ep->remoteMac, &eth->dst_addr);
-  rte_ether_addr_copy(&ep->localMac, &eth->src_addr);
+  rte_ether_addr_copy(remoteMac, &eth->dst_addr);
+  rte_ether_addr_copy(localMac, &eth->src_addr);
   eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 
   struct rte_ipv4_hdr *ip =
@@ -79,50 +65,44 @@ bool ncdpTrySendFrame(const ncdpEndpoint *ep, uint16_t flags,
   ip->time_to_live = 64;
   ip->next_proto_id = IPPROTO_UDP;
   ip->hdr_checksum = 0;
-  ip->src_addr = ep->localIp;
-  ip->dst_addr = ep->remoteIp;
+  ip->src_addr = localIp;
+  ip->dst_addr = remoteIp;
   ip->hdr_checksum = rte_ipv4_cksum(ip);
 
   struct rte_udp_hdr *udp =
       (struct rte_udp_hdr *)((char *)ip + sizeof(struct rte_ipv4_hdr));
-  uint16_t port = udpPort ? udpPort : ep->udpPort;
-  udp->src_port = rte_cpu_to_be_16(port);
-  udp->dst_port = rte_cpu_to_be_16(port);
+  udp->src_port = rte_cpu_to_be_16(udpPort);
+  udp->dst_port = rte_cpu_to_be_16(udpPort);
   udp->dgram_len = rte_cpu_to_be_16((uint16_t)l4Len);
   udp->dgram_cksum = 0;
 
-  ncdpWireHdr *hdr = (ncdpWireHdr *)((char *)udp + sizeof(struct rte_udp_hdr));
-  hdr->magic = rte_cpu_to_be_32(NCDP_MAGIC);
-  hdr->flags = rte_cpu_to_be_16(flags);
-  hdr->reserved0 = 0;
-  hdr->dstCommId = rte_cpu_to_be_32(dstCommId);
-  hdr->srcCommId = rte_cpu_to_be_32(srcCommId);
-  hdr->reqId = rte_cpu_to_be_32(reqId);
-  hdr->taskId = rte_cpu_to_be_32(taskId);
-  hdr->seq = rte_cpu_to_be_32(seq);
-  hdr->len = rte_cpu_to_be_16(len);
-  hdr->reserved2 = 0;
+  ncdpHdr *wireHdr = (ncdpHdr *)((char *)udp + sizeof(struct rte_udp_hdr));
+  wireHdr->magic = rte_cpu_to_be_32(NCDP_MAGIC);
+  wireHdr->flags = rte_cpu_to_be_16(flags);
+  wireHdr->reserved0 = 0;
+  wireHdr->dstCommId = rte_cpu_to_be_32(dstCommId);
+  wireHdr->srcCommId = rte_cpu_to_be_32(srcCommId);
+  wireHdr->srcReqId = rte_cpu_to_be_32(srcReqId);
+  wireHdr->dstReqId = rte_cpu_to_be_32(dstReqId);
+  wireHdr->taskId = rte_cpu_to_be_32(taskId);
+  wireHdr->seq = rte_cpu_to_be_32(seq);
+  wireHdr->len = rte_cpu_to_be_16(len);
+  wireHdr->reserved2 = 0;
 
   if (len > 0 && payload) {
-    memcpy((char *)hdr + sizeof(ncdpWireHdr), payload, len);
-  }
-
-  struct rte_mbuf *txPkts[1] = {mbuf};
-  int sent = rte_eth_tx_burst(ep->portId, 0, txPkts, 1);
-  if (sent < 1) {
-    rte_pktmbuf_free(mbuf);
-    return false;
+    memcpy((char *)wireHdr + sizeof(ncdpHdr), payload, len);
   }
   return true;
 }
 
-static bool ncdpParsePacket(struct rte_mbuf *mbuf, uint16_t udpPort,
-                            ncdpHdr *outHdr, const uint8_t **payload,
-                            uint16_t *payloadLen) {
+bool ncdpParsePacket(struct rte_mbuf *mbuf, ncdpHdr *hdr,
+                     const uint8_t **payload, uint16_t *payloadLen) {
+  if (mbuf == NULL || hdr == NULL || payload == NULL || payloadLen == NULL)
+    return false;
   int dataLen = rte_pktmbuf_data_len(mbuf);
   if (dataLen <
       (int)(sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) +
-            sizeof(struct rte_udp_hdr) + sizeof(ncdpWireHdr)))
+            sizeof(struct rte_udp_hdr) + sizeof(ncdpHdr)))
     return false;
 
   char *data = rte_pktmbuf_mtod(mbuf, char *);
@@ -138,58 +118,37 @@ static bool ncdpParsePacket(struct rte_mbuf *mbuf, uint16_t udpPort,
   if (ipHdrLen < (int)sizeof(struct rte_ipv4_hdr))
     return false;
   if (dataLen < (int)(sizeof(struct rte_ether_hdr) + ipHdrLen +
-                      sizeof(struct rte_udp_hdr) + sizeof(ncdpWireHdr)))
+                      sizeof(struct rte_udp_hdr) + sizeof(ncdpHdr)))
     return false;
   if (ip->next_proto_id != IPPROTO_UDP)
     return false;
 
   struct rte_udp_hdr *udp = (struct rte_udp_hdr *)((char *)ip + ipHdrLen);
-  if (udpPort != 0 && rte_be_to_cpu_16(udp->dst_port) != udpPort)
-    return false;
   uint16_t udpLen = rte_be_to_cpu_16(udp->dgram_len);
-  if (udpLen < sizeof(struct rte_udp_hdr) + sizeof(ncdpWireHdr))
+  if (udpLen < sizeof(struct rte_udp_hdr) + sizeof(ncdpHdr))
     return false;
 
-  ncdpWireHdr *hdr = (ncdpWireHdr *)((char *)udp + sizeof(struct rte_udp_hdr));
-  if (rte_be_to_cpu_32(hdr->magic) != NCDP_MAGIC)
+  const ncdpHdr *wireHdr = (const ncdpHdr *)((char *)udp + sizeof(struct rte_udp_hdr));
+  if (rte_be_to_cpu_32(wireHdr->magic) != NCDP_MAGIC)
     return false;
-  uint16_t len = rte_be_to_cpu_16(hdr->len);
+  uint16_t len = rte_be_to_cpu_16(wireHdr->len);
   if ((int)len >
-      (int)udpLen - (int)sizeof(struct rte_udp_hdr) - (int)sizeof(ncdpWireHdr))
+      (int)udpLen - (int)sizeof(struct rte_udp_hdr) - (int)sizeof(ncdpHdr))
     return false;
 
-  outHdr->magic = rte_be_to_cpu_32(hdr->magic);
-  outHdr->flags = rte_be_to_cpu_16(hdr->flags);
-  outHdr->reserved0 = rte_be_to_cpu_16(hdr->reserved0);
-  outHdr->dstCommId = rte_be_to_cpu_32(hdr->dstCommId);
-  outHdr->srcCommId = rte_be_to_cpu_32(hdr->srcCommId);
-  outHdr->reqId = rte_be_to_cpu_32(hdr->reqId);
-  outHdr->taskId = rte_be_to_cpu_32(hdr->taskId);
-  outHdr->seq = rte_be_to_cpu_32(hdr->seq);
-  outHdr->len = len;
-  outHdr->reserved2 = rte_be_to_cpu_16(hdr->reserved2);
+  hdr->magic = rte_be_to_cpu_32(wireHdr->magic);
+  hdr->flags = rte_be_to_cpu_16(wireHdr->flags);
+  hdr->reserved0 = rte_be_to_cpu_16(wireHdr->reserved0);
+  hdr->dstCommId = rte_be_to_cpu_32(wireHdr->dstCommId);
+  hdr->srcCommId = rte_be_to_cpu_32(wireHdr->srcCommId);
+  hdr->srcReqId = rte_be_to_cpu_32(wireHdr->srcReqId);
+  hdr->dstReqId = rte_be_to_cpu_32(wireHdr->dstReqId);
+  hdr->taskId = rte_be_to_cpu_32(wireHdr->taskId);
+  hdr->seq = rte_be_to_cpu_32(wireHdr->seq);
+  hdr->len = len;
+  hdr->reserved2 = rte_be_to_cpu_16(wireHdr->reserved2);
 
-  *payload = (const uint8_t *)hdr + sizeof(ncdpWireHdr);
+  *payload = (const uint8_t *)wireHdr + sizeof(ncdpHdr);
   *payloadLen = len;
   return true;
-}
-
-int ncdpPollRx(int portId, uint16_t udpPort, ncdpRxCallback cb, void *ctx) {
-  struct rte_mbuf *mbufs[NCDP_RX_BURST];
-  int nb = rte_eth_rx_burst(portId, 0, mbufs, NCDP_RX_BURST);
-  if (nb <= 0)
-    return 0;
-
-  for (int i = 0; i < nb; i++) {
-    struct rte_mbuf *mbuf = mbufs[i];
-    ncdpHdr hdr;
-    const uint8_t *payload = NULL;
-    uint16_t payloadLen = 0;
-    if (ncdpParsePacket(mbuf, udpPort, &hdr, &payload, &payloadLen)) {
-      if (cb)
-        cb(ctx, &hdr, payload, payloadLen);
-    }
-    rte_pktmbuf_free(mbuf);
-  }
-  return nb;
 }

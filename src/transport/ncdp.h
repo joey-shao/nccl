@@ -10,7 +10,7 @@
 #include <rte_ether.h>
 #include <stdint.h>
 
-struct rte_mempool;
+struct rte_mbuf;
 
 enum ncdpFlags {
   NCDP_FLAG_DATA = 1,
@@ -23,32 +23,27 @@ typedef struct __attribute__((packed)) ncdpHdr {
   uint16_t reserved0;
   uint32_t dstCommId;
   uint32_t srcCommId;
-  uint32_t reqId;
+  uint32_t srcReqId;
+  uint32_t dstReqId;
+  // Task id within one request.
   uint32_t taskId;
+  // Global frame sequence inside one request.
   uint32_t seq;
+  // Payload bytes following ncdpHdr.
   uint16_t len;
   uint16_t reserved2;
 } ncdpHdr;
 
-struct ncdpEndpoint {
-  int portId;
-  struct rte_mempool *pool;
-  struct rte_ether_addr localMac;
-  struct rte_ether_addr remoteMac;
-  uint32_t localIp;
-  uint32_t remoteIp;
-  uint16_t udpPort;
-  int maxPayload;
-};
-
-typedef void (*ncdpRxCallback)(void *ctx, const ncdpHdr *hdr,
-                               const uint8_t *payload, uint16_t len);
-
 int ncdpComputeMaxPayload(int mtu);
-bool ncdpTrySendFrame(const ncdpEndpoint *ep, uint16_t flags,
-                      uint32_t dstCommId, uint32_t srcCommId, uint32_t reqId,
-                      uint32_t taskId, uint32_t seq, const void *payload,
-                      uint16_t len, uint16_t udpPort);
-int ncdpPollRx(int portId, uint16_t udpPort, ncdpRxCallback cb, void *ctx);
+bool ncdpBuildPacket(struct rte_mbuf *mbuf,
+                     const struct rte_ether_addr *localMac,
+                     const struct rte_ether_addr *remoteMac, uint32_t localIp,
+                     uint32_t remoteIp, uint16_t flags,
+                     uint32_t dstCommId, uint32_t srcCommId,
+                     uint32_t srcReqId, uint32_t dstReqId, uint32_t taskId,
+                     uint32_t seq, const void *payload,
+                     uint16_t len, uint16_t udpPort);
+bool ncdpParsePacket(struct rte_mbuf *mbuf, ncdpHdr *outHdr,
+                     const uint8_t **payload, uint16_t *payloadLen);
 
 #endif
