@@ -12,8 +12,10 @@
 #include "nvmlwrap.h"
 #include "coll_net.h"
 #include "transport.h"
+#include "param.h"
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <limits.h>
 #include "cpuset.h"
 #include "bootstrap.h"
 #include <mutex>
@@ -24,6 +26,7 @@
 const char* topoNodeTypeStr[] = { "GPU", "PCI", "NVS", "CPU", "NIC", "NET" };
 const char* topoLinkTypeStr[] = { "LOC", "NVL", "",    "C2C", "PCI",    "",    "",    "",    "", "SYS", "NET" };
 const char* topoPathTypeStr[] = { "LOC", "NVL", "NVB", "C2C", "PIX", "PXB", "P2C", "PXN", "PHB", "SYS", "NET", "DIS" };
+NCCL_PARAM(TopoNetVDevCount, "NET_VDEV_COUNT", 0);
 
 /******************************************************************/
 /******************* Graph Creation Functions *********************/
@@ -1014,8 +1017,12 @@ ncclResult_t ncclTopoMakeVnic(struct ncclXml* xml, struct ncclTopoNetInfo* netIn
   ncclResult_t ret;
   NOWARN(ret = netInfo->makeVDevice(&vDevIndex, vProps), NCCL_GRAPH|NCCL_INIT|NCCL_NET);
   if (ret != ncclSuccess) {
-    INFO(NCCL_GRAPH|NCCL_INIT|NCCL_NET, "TOPO/NET : Tried merging multiple devices together and failed. vProps={ndevs=%d, devs=[%d %d %d %d]}. Set NCCL_NET_MERGE_LEVEL=LOC to disable NIC fusion.",
-      vProps->ndevs, vProps->devs[0], vProps->devs[1], vProps->devs[2], vProps->devs[3]);
+    if (vProps->ndevs == 0) {
+      INFO(NCCL_GRAPH|NCCL_INIT|NCCL_NET, "TOPO/NET : Failed to create synthetic vNic (vProps.ndevs=0).");
+    } else {
+      INFO(NCCL_GRAPH|NCCL_INIT|NCCL_NET, "TOPO/NET : Tried merging multiple devices together and failed. vProps={ndevs=%d, devs=[%d %d %d %d]}. Set NCCL_NET_MERGE_LEVEL=LOC to disable NIC fusion.",
+        vProps->ndevs, vProps->devs[0], vProps->devs[1], vProps->devs[2], vProps->devs[3]);
+    }
     return ret;
   }
 
@@ -1262,6 +1269,12 @@ ncclResult_t ncclTopoWidenLinks(ncclXmlNode** physNetNodes, int ndevs, ncclXmlNo
 ncclResult_t ncclTopoGetVNicParent(struct ncclXml* xml, ncclResult_t (*getProperties)(int, ncclNetProperties_t*), ncclNetVDeviceProps_t* vProps, ncclXmlNode** parent) {
   ncclNetProperties_t props[NCCL_NET_MAX_DEVS_PER_NIC];
   ncclXmlNode* physNetNodes[NCCL_NET_MAX_DEVS_PER_NIC];
+
+  if (vProps->ndevs == 0) {
+    *parent = NULL;
+    return ncclSuccess;
+  }
+
   for (int i = 0; i < vProps->ndevs; i++) {
     NCCLCHECK(getProperties(vProps->devs[i], props + i));
     struct ncclXmlNode* physNetNode;
@@ -1296,26 +1309,33 @@ ncclResult_t ncclTopoGetVNicParent(struct ncclXml* xml, ncclResult_t (*getProper
   return ncclSuccess;
 }
 
-ncclResult_t ncclTopoMakeVNics(struct ncclXml* xml, struct ncclTopoNetInfo* netInfo, int physicalDevs) {
+ncclResult_t ncclTopoMakeVNics(struct ncclXml* xml, struct ncclTopoNetInfo* netInfo, int physicalDevs, int syntheticDevs) {
   int* placedDevs = NULL;
   struct ncclXmlNode** physNetNodes = NULL;
   ncclNetProperties_t* props = NULL;
   ncclResult_t res = ncclSuccess;
-  if (physicalDevs == 0) return ncclSuccess;
+  if (physicalDevs > 0) {
+    NCCLCHECK(ncclCalloc(&physNetNodes, physicalDevs));
+    NCCLCHECK(ncclCalloc(&placedDevs, physicalDevs));
+    NCCLCHECK(ncclCalloc(&props, physicalDevs));
+    for (int i = 0; i < physicalDevs; i++) {
+      NCCLCHECKGOTO(netInfo->getProperties(i, props + i), res, out);
+      struct ncclXmlNode* physNetNode;
+      NCCLCHECKGOTO(xmlFindTagKv(xml, "net", &physNetNode, "name", props[i].name), res, out);
+      physNetNodes[i] = physNetNode;
+      TRACE(NCCL_GRAPH, "Found physical ncclNet node %d %s", i,  props[i].name);
+    }
 
-  NCCLCHECK(ncclCalloc(&physNetNodes, physicalDevs));
-  NCCLCHECK(ncclCalloc(&placedDevs, physicalDevs));
-  NCCLCHECK(ncclCalloc(&props, physicalDevs));
-  for (int i = 0; i < physicalDevs; i++) {
-    NCCLCHECKGOTO(netInfo->getProperties(i, props + i), res, out);
-    struct ncclXmlNode* physNetNode;
-    NCCLCHECKGOTO(xmlFindTagKv(xml, "net", &physNetNode, "name", props[i].name), res, out);
-    physNetNodes[i] = physNetNode;
-    TRACE(NCCL_GRAPH, "Found physical ncclNet node %d %s", i,  props[i].name);
+    if (netInfo->forceMerge) NCCLCHECKGOTO(ncclTopoForceMerge(xml, netInfo, placedDevs, props, physNetNodes, physicalDevs), res, out);
+    NCCLCHECKGOTO(ncclTopoAutoMerge(xml, netInfo, placedDevs, props, physNetNodes, physicalDevs), res, out);
   }
 
-  if (netInfo->forceMerge) NCCLCHECKGOTO(ncclTopoForceMerge(xml, netInfo, placedDevs, props, physNetNodes, physicalDevs), res, out);
-  NCCLCHECKGOTO(ncclTopoAutoMerge(xml, netInfo, placedDevs, props, physNetNodes, physicalDevs), res, out);
+  if (syntheticDevs > 0) {
+    for (int i = 0; i < syntheticDevs; i++) {
+      ncclNetVDeviceProps_t vProps = {0};
+      NCCLCHECKGOTO(ncclTopoMakeVnic(xml, netInfo, &vProps, nullptr), res, out);
+    }
+  }
 
 out:
   free(physNetNodes);
@@ -1363,7 +1383,7 @@ static ncclResult_t ncclTopoPopulateNics(ncclXml* xml, int startIndex, int endIn
     NCCLCHECK(xmlGetAttr(netNode, "coll", &colAttr));
     NCCLCHECK(xmlGetAttr(netNode, "keep", &keepAttr));
     INFO(NCCL_GRAPH, "ncclTopoPopulateNics : Filled %s in topo with pciPath=%s keep=%s coll=%s",
-      props.name, props.pciPath, keepAttr, colAttr);
+      props.name, props.pciPath ? props.pciPath : "(null)", keepAttr, colAttr);
   }
 
   return ncclSuccess;
@@ -1372,6 +1392,8 @@ static ncclResult_t ncclTopoPopulateNics(ncclXml* xml, int startIndex, int endIn
 // Calls to network plugin APIs should be protected. This function should be called inside a per-process lock.
 ncclResult_t ncclTopoProcessNet(ncclXml* xml, const char* dumpXmlFile, struct ncclTopoNetInfo* net) {
   bool usePhysicalDevices = (dumpXmlFile || net->makeVDevice == NULL);
+  int nsyntheticNics = ncclParamTopoNetVDevCount();
+
   int nPhysicalNics, nVirtualNics;
   NCCLCHECK(net->getDevCount(net->netPluginIndex, &nPhysicalNics, &nVirtualNics));
   // List the physical devices in the topo
@@ -1379,7 +1401,7 @@ ncclResult_t ncclTopoProcessNet(ncclXml* xml, const char* dumpXmlFile, struct nc
   if (!usePhysicalDevices) {
     // Virtual devices are only created once per network
     if (nVirtualNics == NCCL_UNDEF_DEV_COUNT) {
-      NCCLCHECK(ncclTopoMakeVNics(xml, net, nPhysicalNics));
+      NCCLCHECK(ncclTopoMakeVNics(xml, net, nPhysicalNics, nsyntheticNics));
       // Update the number of virtual devices both locally and in the state tracking the plugin.
       // Note: 0 is a valid number of virtual devices
       int nDevs;

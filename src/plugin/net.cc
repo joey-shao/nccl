@@ -35,6 +35,7 @@ extern getNcclCollNet_t getNcclCollNet_v10;
 extern getNcclCollNet_t getNcclCollNet_v11;
 extern getNcclGin_t getNcclGin_v11;
 NCCL_PARAM(NetPluginRefCount, "NET_PLUGIN_REF_COUNT", 0);
+NCCL_PARAM(NetPluginVDevCount, "NET_VDEV_COUNT", 0);
 #define NCCL_NET_VERSION_COUNT 6
 int ncclNetVersion[NCCL_NET_VERSION_COUNT] = {11, 10, 9, 8, 7, 6};
 getNcclNet_t* getNcclNet[NCCL_NET_VERSION_COUNT] = {getNcclNet_v11, getNcclNet_v10, getNcclNet_v9, getNcclNet_v8, getNcclNet_v7, getNcclNet_v6};
@@ -171,6 +172,7 @@ ncclResult_t ncclNetCheckDeviceVersion(struct ncclComm* comm, ncclNet_t* net, in
 
 static ncclResult_t ncclNetPluginInit(struct ncclComm* comm, netPluginLib_t* pluginLib) {
   int ndev;
+  int syntheticVDevCount = ncclParamNetPluginVDevCount();
   // Init must be called for each new comm to set the right context
   if (pluginLib->ncclNetPluginState >= ncclNetPluginStateInitReady && pluginLib->ncclNet) {
     ncclNetCommConfig_t commConfig = {};
@@ -179,7 +181,8 @@ static ncclResult_t ncclNetPluginInit(struct ncclComm* comm, netPluginLib_t* plu
   }
   // Detection of the devices is only done when the plugin is being initialized the first time
   if (pluginLib->ncclNetPluginState == ncclNetPluginStateInitReady && pluginLib->ncclNet) {
-    if (pluginLib->ncclNet->devices(&ndev) != ncclSuccess || ndev <= 0) goto fail;
+    bool allowZeroPhys = (syntheticVDevCount > 0) && (pluginLib->ncclNet->makeVDevice != NULL);
+    if (pluginLib->ncclNet->devices(&ndev) != ncclSuccess || ndev < 0 || (ndev == 0 && !allowZeroPhys)) goto fail;
     pluginLib->netPhysDevs = ndev;
     pluginLib->netVirtDevs = NCCL_UNDEF_DEV_COUNT;
   }
@@ -192,7 +195,8 @@ static ncclResult_t ncclNetPluginInit(struct ncclComm* comm, netPluginLib_t* plu
   }
   // Detection of the devices is only done when the plugin is being initialized the first time
   if (pluginLib->ncclCollNetPluginState == ncclNetPluginStateInitReady && pluginLib->ncclCollNet) {
-    if (pluginLib->ncclCollNet->devices(&ndev) != ncclSuccess || ndev <= 0) pluginLib->ncclCollNetPluginState = ncclNetPluginStateDisabled;
+    bool allowZeroPhys = (syntheticVDevCount > 0) && (pluginLib->ncclCollNet->makeVDevice != NULL);
+    if (pluginLib->ncclCollNet->devices(&ndev) != ncclSuccess || ndev < 0 || (ndev == 0 && !allowZeroPhys)) pluginLib->ncclCollNetPluginState = ncclNetPluginStateDisabled;
     else {
       pluginLib->collNetPhysDevs = ndev;
       pluginLib->collNetVirtDevs = NCCL_UNDEF_DEV_COUNT;
@@ -233,7 +237,9 @@ fail:
 }
 
 static ncclResult_t ncclNetPluginAssignToComm(struct ncclComm* comm, int pluginIndex, bool* isAssigned) {
-  if (ncclSuccess != ncclNetCheckDeviceVersion(comm, netPluginLibs[pluginIndex].ncclNet, 0)) goto fail;
+  if (netPluginLibs[pluginIndex].netPhysDevs > 0) {
+    if (ncclSuccess != ncclNetCheckDeviceVersion(comm, netPluginLibs[pluginIndex].ncclNet, 0)) goto fail;
+  }
 
   if (netPluginLibs[pluginIndex].ncclNetPluginState >= ncclNetPluginStateEnabled) {
     comm->ncclNet = netPluginLibs[pluginIndex].ncclNet;
