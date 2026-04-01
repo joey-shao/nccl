@@ -520,10 +520,6 @@ static ncclResult_t dpdkInitDataPort(ncclNetDpdkDev *dev) {
 
 // Discover and initialize all physical DPDK ports used for data transfer.
 static ncclResult_t dpdkInitDataDevices() {
-  if (rte_eth_dev_count_avail() <= 0) {
-    WARN("NET/DPDK : no DPDK ports available");
-    return ncclInternalError;
-  }
   if (ncclNetDpdkDataIps.empty()) {
     WARN("NET/DPDK : data IP config is empty, load %s first",
          ncclNetDpdkDataIpConfPath.c_str());
@@ -560,7 +556,7 @@ static ncclResult_t dpdkInitDataDevices() {
     matched++;
   }
 
-  if (matched <= 0) {
+  if (rte_eth_dev_count_avail() > 0 && matched <= 0) {
     WARN("NET/DPDK : no DPDK data-plane device available");
     return ncclInternalError;
   }
