@@ -26,16 +26,18 @@ static const char* selectedNetSymbol() { return "ncclNetSocket"; }
 
 struct Options {
   int dev = -1;         // -1 => auto choose dev 0
+  int vdeviceNum = 0;   // number of virtual devices to create after init
   int timeoutMs = 10000;
   bool verbose = false;
 };
 
 static void usage(const char* prog) {
   std::cerr
-      << "Usage: " << prog << " [--dev <idx>] [--timeout-ms <ms>] [--verbose]\n"
+      << "Usage: " << prog
+      << " [--dev <idx>] [--vdevice-num <num>] [--timeout-ms <ms>] [--verbose]\n"
       << "Examples:\n"
       << "  " << prog << "\n"
-      << "  " << prog << " --dev 0 --timeout-ms 15000 --verbose\n";
+      << "  " << prog << " --dev 0 --vdevice-num 2 --timeout-ms 15000 --verbose\n";
 }
 
 static bool parseInt(const char* s, int* out) {
@@ -52,6 +54,8 @@ static bool parseArgs(int argc, char** argv, Options* opt) {
     std::string a = argv[i];
     if (a == "--dev" && i + 1 < argc) {
       if (!parseInt(argv[++i], &opt->dev)) return false;
+    } else if (a == "--vdevice-num" && i + 1 < argc) {
+      if (!parseInt(argv[++i], &opt->vdeviceNum)) return false;
     } else if (a == "--timeout-ms" && i + 1 < argc) {
       if (!parseInt(argv[++i], &opt->timeoutMs)) return false;
     } else if (a == "--verbose") {
@@ -63,7 +67,7 @@ static bool parseArgs(int argc, char** argv, Options* opt) {
       return false;
     }
   }
-  return opt->timeoutMs > 0;
+  return opt->timeoutMs > 0 && opt->vdeviceNum >= 0;
 }
 
 static void fillPattern(std::vector<uint8_t>& buf, int seed) {
@@ -301,6 +305,29 @@ int main(int argc, char** argv) {
   if (r != ncclSuccess) {
     std::cerr << "init failed, rc=" << (int)r << "\n";
     return 1;
+  }
+
+  if (opt.vdeviceNum > 0) {
+    if (net->makeVDevice == nullptr) {
+      std::cerr << "selected plugin does not support makeVDevice\n";
+      if (net->finalize) net->finalize(ctx);
+      return 1;
+    }
+    for (int i = 0; i < opt.vdeviceNum; i++) {
+      int vdev = -1;
+      ncclNetVDeviceProps_t vProps{.ndevs = 0};
+      r = net->makeVDevice(&vdev, &vProps);
+      if (r != ncclSuccess) {
+        std::cerr << "makeVDevice failed at " << (i + 1) << "/" << opt.vdeviceNum
+                  << ", rc=" << (int)r << "\n";
+        if (net->finalize) net->finalize(ctx);
+        return 1;
+      }
+      if (opt.verbose) {
+        std::cout << "Created Vdevice index=" << vdev << " (" << (i + 1)
+                  << "/" << opt.vdeviceNum << ")\n";
+      }
+    }
   }
 
   int ndev = 0;
