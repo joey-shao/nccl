@@ -447,18 +447,23 @@ static ncclResult_t dpdkInitEal() {
     }
   }
 
-  std::vector<char *> argv;
-  argv.reserve(args.size());
+  std::vector<char *> ownedArgv;
+  ownedArgv.reserve(args.size());
   for (auto &a : args) {
     char *dup = strdup(a.c_str());
-    if (dup == NULL)
+    if (dup == NULL) {
       return ncclSystemError;
-    argv.push_back(dup);
+    }
+    ownedArgv.push_back(dup);
   }
 
-  int ret = rte_eal_init((int)argv.size(), argv.data());
-  for (auto *p : argv)
+  // rte_eal_init may rewrite the argv pointer array in-place. Keep one copy
+  // for EAL and free only the original strdup-ed pointers.
+  std::vector<char *> ealArgv = ownedArgv;
+  int ret = rte_eal_init((int)ealArgv.size(), ealArgv.data());
+  for (auto *p : ownedArgv)
     free(p);
+
   if (ret < 0) {
     WARN("NET/DPDK : rte_eal_init failed");
     return ncclSystemError;
