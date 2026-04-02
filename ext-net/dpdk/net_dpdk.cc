@@ -1985,8 +1985,8 @@ ncclResult_t ncclNetDpdkFinalize(void *ctx) {
   return ncclSuccess;
 }
 
-ncclNet_t ncclNetDpdkSocket = {
-    "DpdkSocket",
+ncclNet_t ncclNetDpdk = {
+    "Dpdk",
     ncclNetDpdkInit,
     ncclNetDpdkDevices,
     ncclNetDpdkGetProperties,
@@ -2012,7 +2012,7 @@ ncclNet_t ncclNetDpdkSocket = {
 
 // External plugin entry point expected by NCCL plugin loader.
 extern "C" __attribute__((visibility("default"))) ncclNet_t ncclNetPlugin_v11 = {
-    "DpdkSocket",
+    "Dpdk",
     ncclNetDpdkInit,
     ncclNetDpdkDevices,
     ncclNetDpdkGetProperties,

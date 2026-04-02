@@ -177,7 +177,8 @@
 
 ### 7.1 选择插件
 
-- `NCCL_NET=DpdkSocket`
+- `NCCL_NET_PLUGIN=/path/to/libnccl-net-dpdk.so`
+- `NCCL_NET=Dpdk`
 
 ### 7.2 DPDK/EAL
 
