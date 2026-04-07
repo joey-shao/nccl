@@ -1594,6 +1594,9 @@ ncclResult_t ncclNetDpdkGetProperties(int dev, ncclNetProperties_t *props) {
   props->maxP2pBytes = NCCL_MAX_NET_SIZE_BYTES;
   props->maxCollBytes = MAX_COLLNET_SIZE;
   props->maxMultiRequestSize = 1;
+
+  // Only support synthetic vNIC
+  props->vProps = {0};
   return ncclSuccess;
 }
 
