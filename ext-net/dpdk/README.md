@@ -30,7 +30,7 @@
   - `dpdkBuildRequestTasks()` 将请求切分为 task/frame
 - 数据面轮询层
   - 每个 net device 一个 `dpdkPollThread`
-  - `dpdkPollRx()` 收包，`dpdkProgressSendRequest()` 推进发送，`dpdkProgressRecvRequest()` 回复 ACK
+  - `dpdkPollRx()` 收包，线程内发送队列推进 send task，`dpdkProgressRecvRequest()` 回复 ACK
 
 ### 2.2 并发模型
 
@@ -41,6 +41,9 @@
 - 每设备线程
   - `dpdkPollThreads[dev]` 维护线程生命周期和附着 comm 列表
   - 线程主循环：`dpdkPollThreadMain()`
+  - send task 以队列形式挂到目标 `dev` 的 poll thread，线程只发本设备端口
+  - recv task 的 ACK 回包端点在控制面握手配对阶段确定
+  - 若 ACK 异常落到其他线程，仍保留线程转发兜底
 
 ## 3. 初始化流程
 
@@ -113,9 +116,10 @@
 控制消息结构：`dpdkCtrlMsg`。
 
 - `DPDK_CTRL_SEND`
-  - 发送侧声明 `srcReqId/size/frameSize`。
+  - 发送侧声明 `srcReqId/size/frameSize`，并携带“当前网卡 + 可选空闲网卡”的候选端点（`dev/MAC/IP`）。
 - `DPDK_CTRL_READY`
   - 接收侧返回 `srcReqId`，并用 `dstReqId` 绑定发送请求。
+  - 接收侧根据“发送方候选网卡 + 本地候选网卡”生成 task lane 配对结果（最多 2 路）并回传。
 
 ### 5.2 请求状态机
 
@@ -140,11 +144,17 @@
 - `NCCL_DPDK_FRAME_WINDOW` 不参与 task 数计算，只用于每个 task 的发送窗口（`cwnd`）和收发 ring slot 大小。
 
 - 发送侧 `dpdkSendTask`
+  - `txDev` 与对端 `MAC/IP` 由 `DPDK_CTRL_READY` 回传的 lane 配对结果决定。
+  - task 默认按 lane 轮转（双 lane 时奇偶 task 分发到不同 lane）。
+  - 若配对结果无效，回退到 `comm` 默认端点。
+  - task 创建后会被 append 到 `txDev` 对应 poll thread 的发送队列，由该线程独占推进与发包。
   - `sndUna/sndNxt/inflight/cwnd`
   - `ackedBitmap` + ring slot 追踪 ACK 前缀
 - 接收侧 `dpdkRecvTask`
   - `rcvNxt/ackPending/ackDeadlineTsc`
   - 支持乱序缓存与连续前缀提交
+
+说明：分流仅改变本端发包网卡，仍使用同一 `commId` 与对端会话。实验时需确保被选中的网卡都能到达同一对端 `MAC/IP`。
 
 ### 5.4 ACK 策略
 
@@ -153,6 +163,7 @@
   - `NCCL_DPDK_ACK_EVERY`
   - `NCCL_DPDK_ACK_DELAY_US`
 - `dpdkProgressRecvRequest()` 周期性刷新 delayed ACK。
+- ACK 端点使用控制面配对得到的 task 对端端点；若配对缺失或非法，回退到 `comm` 默认端点。
 
 ### 5.5 UDP 端口选择
 
@@ -197,6 +208,12 @@
   - 单个 task 的最小 frame 数；用于约束 task 数，避免 task 粒度过碎。
 - `NCCL_DPDK_ACK_EVERY`（默认 8）
 - `NCCL_DPDK_ACK_DELAY_US`（默认 10）
+- `NCCL_DPDK_LB_BALANCE`（默认 0）
+  - 负载均衡总开关；仅当该值非 0 时启用多网卡分流与 lane 配对。
+- `NCCL_DPDK_LB_BUSY_TASKS`（默认 8）
+  - 当请求首选 `dev` 的 in-flight task 数达到该阈值时，触发分流判定（需 `NCCL_DPDK_BALANCE!=0`）。
+- `NCCL_DPDK_LB_MIN_TASKS`（默认 4）
+  - 仅当 request 的 task 数不少于该值时才允许分流，避免小请求被过度切分（需 `NCCL_DPDK_BALANCE!=0`）。
 
 ### 7.4 vdev 相关
 

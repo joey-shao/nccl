@@ -44,7 +44,7 @@
 #define DPDK_MAX_REQUESTS NCCL_NET_MAX_REQUESTS
 
 #define DPDK_CTRL_MAGIC 0x4e43444bU // "NCDK"
-#define DPDK_PROTO_VERSION 3
+#define DPDK_PROTO_VERSION 4
 
 #define DPDK_RX_BURST 32
 #define DPDK_TX_BURST 32
@@ -53,6 +53,9 @@
 #define DPDK_RX_DESC 1024
 #define DPDK_TX_DESC 1024
 #define DPDK_INVALID_SEQ UINT32_MAX
+#define DPDK_INVALID_DEV -1
+#define DPDK_MAX_CTRL_LANES 2
+#define DPDK_MAX_CTRL_PAIRS 2
 
 // Runtime knobs used by this DPDK transport implementation.
 // Data plane is DPDK/UDP; control plane remains ncclSocket-based TCP.
@@ -61,6 +64,9 @@ NCCL_DPDK_PARAM(DpdkMaxTasksPerRequest, "DPDK_MAX_TASKS_PER_REQUEST", 8)
 NCCL_DPDK_PARAM(DpdkMinTaskFrames, "DPDK_MIN_TASK_FRAMES", 4096)
 NCCL_DPDK_PARAM(DpdkAckEvery, "DPDK_ACK_EVERY", 8)
 NCCL_DPDK_PARAM(DpdkAckDelayUs, "DPDK_ACK_DELAY_US", 10)
+NCCL_DPDK_PARAM(DpdkLbBalance, "DPDK_LB_BALANCE", 0)
+NCCL_DPDK_PARAM(DpdkLbBusyTasks, "DPDK_LB_BUSY_TASKS", 8)
+NCCL_DPDK_PARAM(DpdkLbMinTasks, "DPDK_LB_MIN_TASKS", 4)
 
 // Control-plane messages exchanged over ncclSocket.
 // SEND announces a new transfer, READY binds the peer request id.
@@ -68,6 +74,20 @@ enum dpdkCtrlType {
   DPDK_CTRL_SEND = 1,
   DPDK_CTRL_READY = 2,
 };
+
+typedef struct __attribute__((packed)) dpdkCtrlLane {
+  uint16_t dev;
+  uint16_t busyQ16;
+  uint32_t speedMbps;
+  struct rte_ether_addr mac;
+  uint32_t dataIp;
+} dpdkCtrlLane;
+
+typedef struct __attribute__((packed)) dpdkCtrlLanePair {
+  uint8_t sendLane;
+  uint8_t recvLane;
+  uint16_t weight;
+} dpdkCtrlLanePair;
 
 // Fixed control header carried on the control socket.
 typedef struct __attribute__((packed)) dpdkCtrlMsg {
@@ -78,6 +98,12 @@ typedef struct __attribute__((packed)) dpdkCtrlMsg {
   uint32_t dstReqId;
   uint32_t size;
   uint32_t frameSize;
+  uint32_t numTasks;
+  uint16_t laneCount;
+  uint16_t pairCount;
+  dpdkCtrlLane lanes[DPDK_MAX_CTRL_LANES];
+  dpdkCtrlLanePair pairs[DPDK_MAX_CTRL_PAIRS];
+  uint32_t pairSeed;
 } dpdkCtrlMsg;
 
 // Data-plane identity exchanged once during connect/accept.
@@ -102,11 +128,24 @@ struct dpdkFrameMeta {
   uint32_t seq;
   // Payload bytes in this frame slot (last frame may be shorter).
   uint16_t len;
-  uint8_t state;
-  uint8_t reserved;
+  uint16_t state;
+};
+
+struct dpdkTaskEndpoint {
+  int dev;
+  int portId;
+  struct rte_mempool *pool;
+  struct rte_ether_addr localMac;
+  struct rte_ether_addr remoteMac;
+  uint32_t localIp;
+  uint32_t remoteIp;
 };
 
 struct dpdkSendTask {
+  uint32_t taskId;
+  int attachedDev;
+  int isAttached;
+  struct dpdkTaskEndpoint endpoint;
   // First global frame seq covered by this task.
   uint32_t baseSeq;
   int frameSize;
@@ -134,8 +173,10 @@ struct dpdkRecvTask {
   // First global frame seq covered by this task.
   uint32_t baseSeq;
   // Task index echoed on data/ack packets.
-  uint16_t taskId;
-  uint16_t reserved0;
+  uint32_t taskId;
+  int attachedDev;
+  int isAttached;
+  struct dpdkTaskEndpoint endpoint;
   int frameSize;
   int numFrames;
   int completedFrames;
@@ -213,7 +254,15 @@ struct ncclNetDpdkRequest {
   int frameSize;
   int numFrames;
   int numTasks;
-  int completedTasks;
+  std::atomic<int> completedTasks;
+  uint16_t localLaneCount;
+  uint16_t peerLaneCount;
+  uint16_t pairCount;
+  uint16_t pairWeightSum;
+  uint32_t pairSeed;
+  dpdkCtrlLane localLanes[DPDK_MAX_CTRL_LANES];
+  dpdkCtrlLane peerLanes[DPDK_MAX_CTRL_LANES];
+  dpdkCtrlLanePair pairs[DPDK_MAX_CTRL_PAIRS];
   // Per-op request state. SEND and RECV do not overlap in a single request.
   union {
     struct dpdkSendRequestState send;
@@ -275,17 +324,34 @@ struct ncclNetDpdkDev {
   struct rte_mempool *pool;
   struct rte_ether_addr mac;
   int mtu;
+  int speedMbps;
+};
+
+struct dpdkSendTaskRef {
+  struct ncclNetDpdkRequest *req;
+  struct dpdkSendTask *task;
+};
+
+struct dpdkRecvTaskRef {
+  struct ncclNetDpdkRequest *req;
+  struct dpdkRecvTask *task;
 };
 
 struct dpdkPollThread {
   std::mutex mutex;
   int portId;
   int dev;
-  // Number of comms using this worker.
+  // Number of tasks attached to this worker.
   int refCount;
   int stopRequested;
   unsigned lcoreId;
-  std::vector<struct ncclNetDpdkComm *> attachedComms;
+  std::vector<struct dpdkSendTaskRef> sendTasks;
+  std::vector<struct dpdkRecvTaskRef> recvTasks;
+  uint32_t busyQ16;
+  uint64_t txAttempts;
+  uint64_t txDrops;
+  uint64_t rxPkts;
+  uint64_t lastLoadTsc;
 };
 
 // Process-local transport state.
@@ -313,6 +379,8 @@ static std::vector<uint32_t> ncclNetDpdkDataIps;
 static dpdkPollThread dpdkPollThreads[DPDK_MAX_DEVS];
 
 static void dpdkReleaseRequestFrames(struct ncclNetDpdkRequest *r);
+static void dpdkDetachRequestTasks(struct ncclNetDpdkRequest *req);
+static ncclResult_t ncclNetDpdkGetSpeed(int dev, int *speed);
 
 // Internal static helpers are ordered by responsibility:
 // 1) init / device discovery
@@ -556,6 +624,7 @@ static ncclResult_t dpdkInitDataDevices() {
     dev->pciPath = pciPath;
     dev->portId = (int)portId;
     NCCLCHECK(dpdkInitDataPort(dev));
+    NCCLCHECK(ncclNetDpdkGetSpeed(matched, &dev->speedMbps));
     matched++;
   }
 
@@ -675,7 +744,15 @@ static void dpdkReleaseRequestFrames(struct ncclNetDpdkRequest *r) {
   r->frameSize = 0;
   r->numFrames = 0;
   r->numTasks = 0;
-  r->completedTasks = 0;
+  r->completedTasks.store(0, std::memory_order_relaxed);
+  r->localLaneCount = 0;
+  r->peerLaneCount = 0;
+  r->pairCount = 0;
+  r->pairWeightSum = 0;
+  r->pairSeed = 0;
+  memset(r->localLanes, 0, sizeof(r->localLanes));
+  memset(r->peerLanes, 0, sizeof(r->peerLanes));
+  memset(r->pairs, 0, sizeof(r->pairs));
 }
 
 static inline struct ncclNetDpdkRequest *
@@ -700,6 +777,26 @@ static int dpdkSelectFrameSize(struct ncclNetDpdkComm *comm, int size) {
   return frameSize;
 }
 
+static inline void dpdkInitTaskEndpointFromDev(struct dpdkTaskEndpoint *ep,
+                                               int localDev,
+                                               const struct rte_ether_addr *remoteMac,
+                                               uint32_t remoteIp) {
+  memset(ep, 0, sizeof(*ep));
+  if (localDev < 0 || localDev >= ncclNetDpdkIfs) {
+    ep->dev = DPDK_INVALID_DEV;
+    ep->portId = -1;
+    return;
+  }
+  ep->dev = localDev;
+  ep->portId = ncclNetDpdkDevs[localDev].portId;
+  ep->pool = ncclNetDpdkDevs[localDev].pool;
+  ep->localMac = ncclNetDpdkDevs[localDev].mac;
+  ep->localIp = ncclNetDpdkDevs[localDev].addr.sin.sin_addr.s_addr;
+  ep->remoteIp = remoteIp;
+  if (remoteMac)
+    ep->remoteMac = *remoteMac;
+}
+
 // Allocate one free request slot and seed initial control-plane state.
 static ncclResult_t dpdkGetRequest(struct ncclNetDpdkComm *comm, int op,
                                      void *data, int size,
@@ -720,6 +817,11 @@ static ncclResult_t dpdkGetRequest(struct ncclNetDpdkComm *comm, int op,
       if (r->reqId == 0)
         r->reqId = ++comm->nextReqId;
       r->peerReqId = 0;
+      r->localLaneCount = 0;
+      r->peerLaneCount = 0;
+      r->pairCount = 0;
+      r->pairWeightSum = 0;
+      r->pairSeed = 0;
       if (op == NCCL_SOCKET_SEND)
         r->frameSize = dpdkSelectFrameSize(comm, size);
       r->state.store((op == NCCL_SOCKET_SEND) ? DPDK_REQ_SEND_CTRL
@@ -775,6 +877,13 @@ static ncclResult_t dpdkBuildRequestTasks(struct ncclNetDpdkRequest *r,
     NCCLCHECK(ncclCalloc(&s->tasks, r->numTasks));
     for (int t = 0; t < r->numTasks; t++) {
       struct dpdkSendTask *task = s->tasks + t;
+      memset(task, 0, sizeof(*task));
+      task->taskId = t;
+      task->attachedDev = r->comm ? r->comm->dev : DPDK_INVALID_DEV;
+      task->isAttached = 0;
+      if (r->comm)
+        dpdkInitTaskEndpointFromDev(&task->endpoint, r->comm->dev,
+                                    &r->comm->remoteMac, r->comm->remoteIp);
       task->baseSeq = taskBaseSeqFor(t);
       task->numFrames = taskNumFramesFor(t);
       task->frameSize = frameSize;
@@ -797,7 +906,6 @@ static ncclResult_t dpdkBuildRequestTasks(struct ncclNetDpdkRequest *r,
         task->frames[i].seq = DPDK_INVALID_SEQ;
         task->frames[i].len = 0;
         task->frames[i].state = DPDK_FRAME_EMPTY;
-        task->frames[i].reserved = 0;
       }
     }
     s->nextTaskCursor = 0;
@@ -809,7 +917,12 @@ static ncclResult_t dpdkBuildRequestTasks(struct ncclNetDpdkRequest *r,
       memset(task, 0, sizeof(*task));
       task->baseSeq = taskBaseSeqFor(t);
       task->numFrames = taskNumFramesFor(t);
-      task->taskId = (uint16_t)t;
+      task->taskId = t;
+      task->attachedDev = r->comm ? r->comm->dev : DPDK_INVALID_DEV;
+      task->isAttached = 0;
+      if (r->comm)
+        dpdkInitTaskEndpointFromDev(&task->endpoint, r->comm->dev,
+                                    &r->comm->remoteMac, r->comm->remoteIp);
       task->frameSize = frameSize;
       task->completedFrames = 0;
       task->isDone = 0;
@@ -826,7 +939,6 @@ static ncclResult_t dpdkBuildRequestTasks(struct ncclNetDpdkRequest *r,
         task->frames[i].seq = DPDK_INVALID_SEQ;
         task->frames[i].len = 0;
         task->frames[i].state = DPDK_FRAME_EMPTY;
-        task->frames[i].reserved = 0;
       }
     }
     v->recvDoneFrames = 0;
@@ -836,7 +948,7 @@ static ncclResult_t dpdkBuildRequestTasks(struct ncclNetDpdkRequest *r,
     return ncclInternalError;
   }
 
-  r->completedTasks = 0;
+  r->completedTasks.store(0, std::memory_order_relaxed);
   return ncclSuccess;
 }
 
@@ -867,31 +979,43 @@ static uint16_t dpdkSelectUdpPort(uint32_t dstCommId, uint32_t srcCommId,
   return (uint16_t)(base + (hash % range));
 }
 
+static inline void dpdkRecordTxResult(int dev, bool success) {
+  if (dev < 0 || dev >= ncclNetDpdkIfs)
+    return;
+  dpdkPollThread *thread = &dpdkPollThreads[dev];
+  __atomic_fetch_add(&thread->txAttempts, 1ull, __ATOMIC_RELAXED);
+  if (!success)
+    __atomic_fetch_add(&thread->txDrops, 1ull, __ATOMIC_RELAXED);
+}
+
 // Build one NCDP packet and submit it on the port.
-static bool dpdkSendPacket(struct ncclNetDpdkComm *comm, uint16_t flags,
+static bool dpdkSendPacket(const struct dpdkTaskEndpoint *ep, uint16_t flags,
                            uint32_t dstCommId, uint32_t srcCommId,
                            uint32_t srcReqId, uint32_t dstReqId,
                            uint32_t taskId, uint32_t seq,
                            const void *payload, uint16_t len) {
-  if (comm == NULL || comm->pool == NULL || comm->portId < 0)
+  if (ep == NULL || ep->pool == NULL || ep->portId < 0 || ep->dev < 0)
     return false;
   uint16_t udpPort =
       dpdkSelectUdpPort(dstCommId, srcCommId, srcReqId, dstReqId, taskId);
-  struct rte_mbuf *mbuf = rte_pktmbuf_alloc(comm->pool);
+  struct rte_mbuf *mbuf = rte_pktmbuf_alloc(ep->pool);
   if (mbuf == NULL)
     return false;
-  if (!ncdpBuildPacket(mbuf, &comm->localMac, &comm->remoteMac, comm->localIp,
-                       comm->remoteIp, flags, dstCommId, srcCommId, srcReqId,
+  if (!ncdpBuildPacket(mbuf, &ep->localMac, &ep->remoteMac, ep->localIp,
+                       ep->remoteIp, flags, dstCommId, srcCommId, srcReqId,
                        dstReqId, taskId, seq, payload, len, udpPort)) {
     rte_pktmbuf_free(mbuf);
+    dpdkRecordTxResult(ep->dev, false);
     return false;
   }
   struct rte_mbuf *txPkts[1] = {mbuf};
-  int sent = rte_eth_tx_burst((uint16_t)comm->portId, 0, txPkts, 1);
+  int sent = rte_eth_tx_burst((uint16_t)ep->portId, 0, txPkts, 1);
   if (sent < 1) {
     rte_pktmbuf_free(mbuf);
+    dpdkRecordTxResult(ep->dev, false);
     return false;
   }
+  dpdkRecordTxResult(ep->dev, true);
   return true;
 }
 
@@ -927,7 +1051,7 @@ static inline void dpdkTryFinishRecvAfterAck(struct ncclNetDpdkRequest *req) {
   struct dpdkRecvRequestState *v = &req->recv;
   if (req->numFrames <= 0 || v->tasks == NULL)
     return;
-  if (req->completedTasks < req->numTasks)
+  if (req->completedTasks.load(std::memory_order_acquire) < req->numTasks)
     return;
   for (int i = 0; i < req->numTasks; i++) {
     struct dpdkRecvTask *task = v->tasks + i;
@@ -939,17 +1063,18 @@ static inline void dpdkTryFinishRecvAfterAck(struct ncclNetDpdkRequest *req) {
 
 // Emit one task-scoped cumulative ACK packet.
 // seq field carries global seq for easier sender-side bounds checks.
-static inline bool dpdkSendTaskAck(struct ncclNetDpdkComm *comm,
-                                   struct ncclNetDpdkRequest *req,
+static inline bool dpdkSendTaskAck(struct ncclNetDpdkRequest *req,
                                    struct dpdkRecvTask *task,
                                    uint32_t ackLocalSeq) {
-  if (req->peerReqId == 0 || req->reqId == 0)
+  if (req->peerReqId == 0 || req->reqId == 0 || req->comm == NULL)
     return false;
+  struct ncclNetDpdkComm *comm = req->comm;
   uint32_t ackSeq = task->baseSeq + ackLocalSeq;
-  if (!dpdkSendPacket(comm, NCDP_FLAG_ACK, comm->remoteCommId, comm->commId,
-                        /*srcReqId=*/req->reqId,
-                        /*dstReqId=*/req->peerReqId,
-                        /*taskId=*/(uint32_t)task->taskId, ackSeq, NULL, 0)) {
+  if (!dpdkSendPacket(&task->endpoint, NCDP_FLAG_ACK, comm->remoteCommId,
+                      comm->commId,
+                      /*srcReqId=*/req->reqId,
+                      /*dstReqId=*/req->peerReqId,
+                      /*taskId=*/task->taskId, ackSeq, NULL, 0)) {
     return false;
   }
   task->ackSentSeq = ackSeq;
@@ -1000,13 +1125,16 @@ static inline void dpdkAdvanceTaskAckPrefix(struct dpdkSendTask *task) {
 
 // Apply one task-scoped cumulative ACK to sender window state.
 static inline void dpdkApplyTaskAck(struct ncclNetDpdkRequest *req,
-                                    uint32_t taskId, uint32_t ackSeq) {
+                                    uint32_t taskId, uint32_t ackSeq,
+                                    int rxDev) {
   struct dpdkSendRequestState *s = &req->send;
   if (s->tasks == NULL || req->numTasks <= 0 || req->numFrames <= 0)
     return;
   if (taskId >= (uint32_t)req->numTasks)
     return;
   struct dpdkSendTask *task = s->tasks + taskId;
+  if (task->attachedDev != rxDev)
+    return;
   if (task->isDone)
     return;
 
@@ -1028,53 +1156,45 @@ static inline void dpdkApplyTaskAck(struct ncclNetDpdkRequest *req,
   dpdkAdvanceTaskAckPrefix(task);
   if (task->completedFrames >= task->numFrames && !task->isDone) {
     task->isDone = 1;
-    req->completedTasks++;
+    int doneTasks =
+        req->completedTasks.fetch_add(1, std::memory_order_acq_rel) + 1;
 
-    if (req->completedTasks >= req->numTasks) {
+    if (doneTasks >= req->numTasks) {
       req->isCompleted.store(1, std::memory_order_release);
     }
   }
 }
 
 // Periodically flush delayed ACKs for each recv task.
-static inline void dpdkProgressRecvRequest(struct ncclNetDpdkComm *comm,
-                                           struct ncclNetDpdkRequest *req) {
-  struct dpdkRecvRequestState *v = &req->recv;
-
-  if (req->state.load(std::memory_order_acquire) != DPDK_REQ_RECEIVING)
+static inline void dpdkProgressRecvTask(struct ncclNetDpdkRequest *req,
+                                        struct dpdkRecvTask *task) {
+  if (req->state.load(std::memory_order_acquire) != DPDK_REQ_RECEIVING ||
+      task == NULL)
     return;
-  if (v->tasks == NULL || req->numTasks <= 0) {
-    dpdkTryFinishRecvAfterAck(req);
-    return;
-  }
   uint64_t nowCycles = rte_get_tsc_cycles();
   uint64_t delayCycles = dpdkAckDelayCycles();
-  for (int i = 0; i < req->numTasks; i++) {
-    struct dpdkRecvTask *task = v->tasks + i;
-    if (task->ackPending == 0 || task->rcvNxt == 0)
-      continue;
-    uint32_t ackSeq = task->baseSeq + (task->rcvNxt - 1);
-    if (ackSeq == task->ackSentSeq) {
-      task->ackPending = 0;
-      task->ackDeadlineTsc = 0;
-      continue;
-    }
-    if (delayCycles > 0 && task->ackDeadlineTsc != 0 &&
-        nowCycles < task->ackDeadlineTsc)
-      continue;
-    if (!dpdkSendTaskAck(comm, req, task, task->rcvNxt - 1)) {
-      uint64_t retryDelay = delayCycles;
-      if (retryDelay == 0)
-        retryDelay = 1;
-      task->ackDeadlineTsc = nowCycles + retryDelay;
-    }
+  if (task->ackPending == 0 || task->rcvNxt == 0)
+    return;
+  uint32_t ackSeq = task->baseSeq + (task->rcvNxt - 1);
+  if (ackSeq == task->ackSentSeq) {
+    task->ackPending = 0;
+    task->ackDeadlineTsc = 0;
+    return;
   }
-  dpdkTryFinishRecvAfterAck(req);
+  if (delayCycles > 0 && task->ackDeadlineTsc != 0 &&
+      nowCycles < task->ackDeadlineTsc)
+    return;
+  if (!dpdkSendTaskAck(req, task, task->rcvNxt - 1)) {
+    uint64_t retryDelay = delayCycles;
+    if (retryDelay == 0)
+      retryDelay = 1;
+    task->ackDeadlineTsc = nowCycles + retryDelay;
+  }
 }
 
 // Packet demux for the data plane:
 // ACK updates sender windows, DATA copies payload and may schedule delayed ACK.
-static void dpdkHandleRxPacket(const ncdpHdr *hdr,
+static void dpdkHandleRxPacket(int rxDev, const ncdpHdr *hdr,
                                const uint8_t *payload, uint16_t len) {
   std::lock_guard<std::mutex> commLock(ncclNetDpdkCommMutex);
   struct ncclNetDpdkComm *comm = dpdkFindCommById(hdr->dstCommId);
@@ -1086,7 +1206,7 @@ static void dpdkHandleRxPacket(const ncdpHdr *hdr,
         dpdkFindRequestByReqId(comm, hdr->dstReqId, DPDK_REQ_SENDING);
     // ACK seq is cumulative within hdr->taskId.
     if (req)
-      dpdkApplyTaskAck(req, hdr->taskId, hdr->seq);
+      dpdkApplyTaskAck(req, hdr->taskId, hdr->seq, rxDev);
     return;
   }
 
@@ -1100,6 +1220,8 @@ static void dpdkHandleRxPacket(const ncdpHdr *hdr,
     if (taskId >= (uint32_t)req->numTasks)
       return;
     struct dpdkRecvTask *task = v->tasks + taskId;
+    if (task->attachedDev != rxDev)
+      return;
     if (task->frames == NULL || task->frameSlots <= 0 || task->numFrames <= 0)
       return;
 
@@ -1140,7 +1262,6 @@ static void dpdkHandleRxPacket(const ncdpHdr *hdr,
       meta->seq = localSeq;
       meta->len = (uint16_t)copyLen;
       meta->state = DPDK_FRAME_DONE;
-      meta->reserved = 0;
       newlyCompleted = true;
     } else {
       return;
@@ -1151,7 +1272,7 @@ static void dpdkHandleRxPacket(const ncdpHdr *hdr,
       v->recvDoneFrames++;
       if (task->completedFrames >= task->numFrames && !task->isDone) {
         task->isDone = 1;
-        req->completedTasks++;
+        req->completedTasks.fetch_add(1, std::memory_order_acq_rel);
       }
     }
 
@@ -1173,7 +1294,7 @@ static void dpdkHandleRxPacket(const ncdpHdr *hdr,
                       (dpdkAckDelayCycles() == 0);
       uint64_t nowCycles = rte_get_tsc_cycles();
       if (forceAck) {
-        if (!dpdkSendTaskAck(comm, req, task, task->rcvNxt - 1)) {
+        if (!dpdkSendTaskAck(req, task, task->rcvNxt - 1)) {
           uint64_t delayCycles = dpdkAckDelayCycles();
           if (delayCycles == 0)
             delayCycles = 1;
@@ -1191,10 +1312,12 @@ static void dpdkHandleRxPacket(const ncdpHdr *hdr,
   }
 }
 
-static int dpdkProgressSendTask(struct ncclNetDpdkComm *comm,
-                                struct ncclNetDpdkRequest *req,
-                                struct dpdkSendTask *task, int taskId,
+static int dpdkProgressSendTask(struct ncclNetDpdkRequest *req,
+                                struct dpdkSendTask *task,
                                 int budget) {
+  if (req == NULL || task == NULL || req->comm == NULL)
+    return 0;
+  struct ncclNetDpdkComm *comm = req->comm;
   int sent = 0;
   // Drain newly acked prefix before trying to send more.
   dpdkAdvanceTaskAckPrefix(task);
@@ -1223,7 +1346,6 @@ static int dpdkProgressSendTask(struct ncclNetDpdkComm *comm,
       meta->seq = localSeq;
       meta->len = (uint16_t)len;
       meta->state = DPDK_FRAME_READY;
-      meta->reserved = 0;
       uint32_t word = (uint32_t)slot >> 6;
       uint32_t bit = (uint32_t)slot & 63u;
       task->ackedBitmap[word] &= ~(1ull << bit);
@@ -1233,10 +1355,11 @@ static int dpdkProgressSendTask(struct ncclNetDpdkComm *comm,
 
     uint32_t seq = task->baseSeq + localSeq;
     uint32_t payloadOffset = (uint32_t)(seq * (uint32_t)req->frameSize);
-    if (!dpdkSendPacket(comm, NCDP_FLAG_DATA, comm->remoteCommId,
+    if (!dpdkSendPacket(&task->endpoint, NCDP_FLAG_DATA, comm->remoteCommId,
                         comm->commId,
                         /*srcReqId=*/req->reqId,
-                        /*dstReqId=*/req->peerReqId, (uint32_t)taskId, seq,
+                        /*dstReqId=*/req->peerReqId,
+                        task->taskId, seq,
                         (char *)req->data + payloadOffset, meta->len)) {
       break;
     }
@@ -1251,78 +1374,318 @@ static int dpdkProgressSendTask(struct ncclNetDpdkComm *comm,
   return sent;
 }
 
-static void dpdkProgressSendRequest(struct ncclNetDpdkComm *comm,
-                                    struct ncclNetDpdkRequest *req) {
-  struct dpdkSendRequestState *s = &req->send;
-  if (req->isCompleted.load(std::memory_order_acquire))
-    return;
-  if (req->numFrames <= 0) {
-    req->isCompleted.store(1, std::memory_order_release);
-    return;
-  }
-  if (s->tasks == NULL || req->numTasks <= 0)
-    return;
-  if (req->frameSize <= 0)
-    return;
-
-  int budget = DPDK_TX_BURST;
-  int tasksScanned = 0;
-  int numTasks = req->numTasks;
-  while (budget > 0 && tasksScanned < numTasks) {
-    int idx = s->nextTaskCursor;
-    s->nextTaskCursor = (idx + 1) % numTasks;
-    tasksScanned++;
-    struct dpdkSendTask *task = s->tasks + idx;
-    if (task->isDone)
-      continue;
-    budget -= dpdkProgressSendTask(comm, req, task, idx, budget);
-  }
-}
-
 // ---------------------------------------------------------------------
 // Polling loop and background progress helpers
 // ---------------------------------------------------------------------
 
-static int dpdkPollRx(int portId) {
+static inline int dpdkGetThreadTaskCount(int dev) {
+  if (dev < 0 || dev >= ncclNetDpdkIfs)
+    return 0;
+  dpdkPollThread *thread = &dpdkPollThreads[dev];
+  std::lock_guard<std::mutex> lock(thread->mutex);
+  return (int)thread->sendTasks.size() + (int)thread->recvTasks.size();
+}
+
+static inline uint16_t dpdkGetThreadBusyQ16(int dev) {
+  if (dev < 0 || dev >= ncclNetDpdkIfs)
+    return 0;
+  return __atomic_load_n(&dpdkPollThreads[dev].busyQ16, __ATOMIC_RELAXED);
+}
+
+static inline bool dpdkLbBalanceEnabled() {
+  return ncclParamDpdkLbBalance() != 0;
+}
+
+static inline void dpdkBuildCtrlLaneFromDev(int dev, dpdkCtrlLane *lane) {
+  memset(lane, 0, sizeof(*lane));
+  if (dev < 0 || dev >= ncclNetDpdkIfs)
+    return;
+  lane->dev = (uint16_t)dev;
+  lane->busyQ16 = dpdkGetThreadBusyQ16(dev);
+  lane->speedMbps = (uint32_t)ncclNetDpdkDevs[dev].speedMbps;
+  lane->mac = ncclNetDpdkDevs[dev].mac;
+  lane->dataIp = ncclNetDpdkDevs[dev].addr.sin.sin_addr.s_addr;
+}
+
+static int dpdkCollectLocalLanes(struct ncclNetDpdkComm *comm, int numTasks,
+                                 dpdkCtrlLane *lanes, int maxLanes) {
+  if (comm == NULL || lanes == NULL || maxLanes <= 0 || comm->dev < 0 ||
+      comm->dev >= ncclNetDpdkIfs) {
+    return 0;
+  }
+  int count = 0;
+  dpdkBuildCtrlLaneFromDev(comm->dev, lanes + count++);
+  if (!dpdkLbBalanceEnabled())
+    return count;
+  if (count >= maxLanes || ncclNetDpdkIfs <= 1)
+    return count;
+  if (numTasks < std::max(1, ncclParamDpdkLbMinTasks()))
+    return count;
+
+  int primaryLoad = dpdkGetThreadTaskCount(comm->dev);
+  if (primaryLoad < std::max(1, ncclParamDpdkLbBusyTasks()))
+    return count;
+
+  int bestDev = -1;
+  uint16_t bestBusy = UINT16_MAX;
+  for (int dev = 0; dev < ncclNetDpdkIfs; dev++) {
+    if (dev == comm->dev)
+      continue;
+    uint16_t busy = dpdkGetThreadBusyQ16(dev);
+    if (bestDev < 0 || busy < bestBusy) {
+      bestDev = dev;
+      bestBusy = busy;
+    }
+  }
+  if (bestDev >= 0)
+    dpdkBuildCtrlLaneFromDev(bestDev, lanes + count++);
+  return count;
+}
+
+static inline void dpdkCopyCtrlLanesFromMsg(const dpdkCtrlMsg *msg,
+                                            dpdkCtrlLane *lanes,
+                                            int *count) {
+  int n = (int)msg->laneCount;
+  if (n > DPDK_MAX_CTRL_LANES)
+    n = DPDK_MAX_CTRL_LANES;
+  for (int i = 0; i < n; i++)
+    lanes[i] = msg->lanes[i];
+  *count = n;
+}
+
+static inline bool dpdkBuildTaskEndpointFromLanes(const dpdkCtrlLane *localLane,
+                                                  const dpdkCtrlLane *remoteLane,
+                                                  struct dpdkTaskEndpoint *ep,
+                                                  int *attachedDev) {
+  if (localLane == NULL || remoteLane == NULL || ep == NULL || attachedDev == NULL)
+    return false;
+  int dev = (int)localLane->dev;
+  if (dev < 0 || dev >= ncclNetDpdkIfs)
+    return false;
+  // remoteLane is packed in ctrl message layout; copy fields to aligned locals
+  // before taking addresses to avoid unaligned-pointer UB/warnings.
+  struct rte_ether_addr remoteMac;
+  uint32_t remoteIp = 0;
+  memcpy(&remoteMac, &remoteLane->mac, sizeof(remoteMac));
+  memcpy(&remoteIp, &remoteLane->dataIp, sizeof(remoteIp));
+  dpdkInitTaskEndpointFromDev(ep, dev, &remoteMac, remoteIp);
+  if (ep->dev < 0 || ep->pool == NULL || ep->portId < 0)
+    return false;
+  *attachedDev = dev;
+  return true;
+}
+
+static int dpdkBuildLanePairPlan(const dpdkCtrlLane *sendLanes, int sendCount,
+                                 const dpdkCtrlLane *recvLanes, int recvCount,
+                                 dpdkCtrlLanePair *pairs, int maxPairs,
+                                 uint16_t *weightSum) {
+  struct PairCandidate {
+    uint64_t score;
+    uint8_t sendIx;
+    uint8_t recvIx;
+  };
+  PairCandidate cand[DPDK_MAX_CTRL_LANES * DPDK_MAX_CTRL_LANES];
+  int candCount = 0;
+
+  for (int s = 0; s < sendCount; s++) {
+    for (int r = 0; r < recvCount; r++) {
+      uint64_t txCap =
+          (uint64_t)std::max(1u, sendLanes[s].speedMbps) *
+          (uint64_t)(65535u - sendLanes[s].busyQ16);
+      uint64_t rxCap =
+          (uint64_t)std::max(1u, recvLanes[r].speedMbps) *
+          (uint64_t)(65535u - recvLanes[r].busyQ16);
+      uint64_t score = std::min(txCap, rxCap);
+      if (score == 0)
+        score = 1;
+      cand[candCount++] = {score, (uint8_t)s, (uint8_t)r};
+    }
+  }
+
+  if (candCount == 0 || maxPairs <= 0) {
+    *weightSum = 0;
+    return 0;
+  }
+
+  std::sort(cand, cand + candCount, [](const PairCandidate &a,
+                                       const PairCandidate &b) {
+    return a.score > b.score;
+  });
+
+  int pairCount = std::min(maxPairs, candCount);
+  uint64_t selectedScore = 0;
+  for (int i = 0; i < pairCount; i++)
+    selectedScore += cand[i].score;
+
+  uint16_t sum = 0;
+  for (int i = 0; i < pairCount; i++) {
+    uint16_t w = 1;
+    if (selectedScore > 0) {
+      w = (uint16_t)std::max<uint64_t>(
+          1ull, (cand[i].score * 256ull) / selectedScore);
+    }
+    pairs[i].sendLane = cand[i].sendIx;
+    pairs[i].recvLane = cand[i].recvIx;
+    pairs[i].weight = w;
+    sum = (uint16_t)(sum + w);
+  }
+  *weightSum = sum;
+  return pairCount;
+}
+
+static int dpdkSelectPairForTask(const struct ncclNetDpdkRequest *req,
+                                 uint32_t taskId) {
+  if (req->pairCount <= 1)
+    return 0;
+  uint16_t sum = req->pairWeightSum;
+  if (sum == 0)
+    return 0;
+  uint32_t pick = dpdkHash32(req->pairSeed ^ taskId) % sum;
+  uint32_t acc = 0;
+  for (int i = 0; i < req->pairCount; i++) {
+    acc += std::max<int>(1, req->pairs[i].weight);
+    if (pick < acc)
+      return i;
+  }
+  return req->pairCount - 1;
+}
+
+static void dpdkApplySendTaskPairing(struct ncclNetDpdkRequest *req) {
+  if (req == NULL || req->send.tasks == NULL)
+    return;
+  for (int i = 0; i < req->numTasks; i++) {
+    struct dpdkSendTask *task = req->send.tasks + i;
+    bool ok = false;
+    if (req->pairCount > 0 && req->localLaneCount > 0 && req->peerLaneCount > 0) {
+      int pairIx = dpdkSelectPairForTask(req, task->taskId);
+      const dpdkCtrlLanePair *pair = &req->pairs[pairIx];
+      if (pair->sendLane < req->localLaneCount &&
+          pair->recvLane < req->peerLaneCount) {
+        ok = dpdkBuildTaskEndpointFromLanes(&req->localLanes[pair->sendLane],
+                                            &req->peerLanes[pair->recvLane],
+                                            &task->endpoint, &task->attachedDev);
+      }
+    }
+    if (!ok && req->comm) {
+      task->attachedDev = req->comm->dev;
+      dpdkInitTaskEndpointFromDev(&task->endpoint, req->comm->dev,
+                                  &req->comm->remoteMac, req->comm->remoteIp);
+    }
+  }
+}
+
+static void dpdkApplyRecvTaskPairing(struct ncclNetDpdkRequest *req) {
+  if (req == NULL || req->recv.tasks == NULL)
+    return;
+  for (int i = 0; i < req->numTasks; i++) {
+    struct dpdkRecvTask *task = req->recv.tasks + i;
+    bool ok = false;
+    if (req->pairCount > 0 && req->localLaneCount > 0 && req->peerLaneCount > 0) {
+      int pairIx = dpdkSelectPairForTask(req, task->taskId);
+      const dpdkCtrlLanePair *pair = &req->pairs[pairIx];
+      if (pair->recvLane < req->localLaneCount &&
+          pair->sendLane < req->peerLaneCount) {
+        ok = dpdkBuildTaskEndpointFromLanes(&req->localLanes[pair->recvLane],
+                                            &req->peerLanes[pair->sendLane],
+                                            &task->endpoint, &task->attachedDev);
+      }
+    }
+    if (!ok && req->comm) {
+      task->attachedDev = req->comm->dev;
+      dpdkInitTaskEndpointFromDev(&task->endpoint, req->comm->dev,
+                                  &req->comm->remoteMac, req->comm->remoteIp);
+    }
+  }
+}
+
+static inline void dpdkUpdatePollThreadLoad(struct dpdkPollThread *thread) {
+  uint64_t now = rte_get_tsc_cycles();
+  uint64_t hz = dpdkTscHz ? dpdkTscHz : rte_get_tsc_hz();
+  uint64_t updateEvery = hz / 10000ULL; // ~100us
+  if (updateEvery == 0)
+    updateEvery = 1;
+  if (thread->lastLoadTsc != 0 && now - thread->lastLoadTsc < updateEvery)
+    return;
+
+  int activeSend = 0;
+  int activeRecv = 0;
+  {
+    std::lock_guard<std::mutex> lock(thread->mutex);
+    activeSend = (int)thread->sendTasks.size();
+    activeRecv = (int)thread->recvTasks.size();
+  }
+
+  uint64_t attempts = __atomic_exchange_n(&thread->txAttempts, 0ull,
+                                          __ATOMIC_RELAXED);
+  uint64_t drops = __atomic_exchange_n(&thread->txDrops, 0ull,
+                                       __ATOMIC_RELAXED);
+  uint64_t rxPkts = __atomic_exchange_n(&thread->rxPkts, 0ull,
+                                        __ATOMIC_RELAXED);
+  uint32_t txFailQ16 = 0;
+  if (attempts > 0)
+    txFailQ16 = (uint32_t)std::min<uint64_t>(65535ull, (drops * 65535ull) / attempts);
+  uint32_t activeTasksQ16 =
+      (uint32_t)std::min<uint64_t>(65535ull, (uint64_t)(activeSend + activeRecv) * 4096ull);
+  uint32_t rxPressureQ16 =
+      (uint32_t)std::min<uint64_t>(65535ull, (rxPkts * 65535ull) / DPDK_RX_BURST);
+
+  uint32_t rawBusy = (txFailQ16 * 6 + activeTasksQ16 * 3 + rxPressureQ16) / 10;
+  uint32_t smooth = ((uint32_t)thread->busyQ16 * 7 + rawBusy) / 8;
+  __atomic_store_n(&thread->busyQ16, (uint16_t)smooth, __ATOMIC_RELAXED);
+  thread->lastLoadTsc = now;
+}
+
+static int dpdkPollRx(struct dpdkPollThread *thread) {
   struct rte_mbuf *mbufs[DPDK_RX_BURST];
-  int nb = rte_eth_rx_burst((uint16_t)portId, 0, mbufs, DPDK_RX_BURST);
+  int nb = rte_eth_rx_burst((uint16_t)thread->portId, 0, mbufs, DPDK_RX_BURST);
   if (nb <= 0)
     return 0;
+  __atomic_fetch_add(&thread->rxPkts, (uint64_t)nb, __ATOMIC_RELAXED);
   for (int i = 0; i < nb; i++) {
     struct rte_mbuf *mbuf = mbufs[i];
     ncdpHdr hdr;
     const uint8_t *payload = NULL;
     uint16_t payloadLen = 0;
     if (ncdpParsePacket(mbuf, &hdr, &payload, &payloadLen))
-      dpdkHandleRxPacket(&hdr, payload, payloadLen);
+      dpdkHandleRxPacket(thread->dev, &hdr, payload, payloadLen);
     rte_pktmbuf_free(mbuf);
   }
   return nb;
 }
 
-static inline void dpdkProgressComms(struct dpdkPollThread *thread) {
-  std::vector<struct ncclNetDpdkComm *> activeComms;
+static inline void dpdkProgressTasks(struct dpdkPollThread *thread) {
+  std::vector<struct dpdkSendTaskRef> sendTasks;
+  std::vector<struct dpdkRecvTaskRef> recvTasks;
   {
     std::lock_guard<std::mutex> lock(thread->mutex);
-    for (auto *comm : thread->attachedComms) {
-      if (comm->closing.load(std::memory_order_acquire))
-        continue;
-      dpdkCommAcquire(comm);
-      activeComms.push_back(comm);
-    }
+    sendTasks = thread->sendTasks;
+    recvTasks = thread->recvTasks;
   }
 
-  for (auto *comm : activeComms) {
-    for (int i = 0; i < DPDK_MAX_REQUESTS; i++) {
-      struct ncclNetDpdkRequest *req = comm->requests + i;
-      int reqState = req->state.load(std::memory_order_acquire);
-      if (reqState == DPDK_REQ_SENDING) {
-        dpdkProgressSendRequest(comm, req);
-      } else if (reqState == DPDK_REQ_RECEIVING) {
-        dpdkProgressRecvRequest(comm, req);
-      }
-    }
-    dpdkCommRelease(comm);
+  int sendBudget = DPDK_TX_BURST;
+  for (auto &ref : sendTasks) {
+    if (sendBudget <= 0)
+      break;
+    if (ref.req == NULL || ref.task == NULL)
+      continue;
+    if (ref.task->attachedDev != thread->dev)
+      continue;
+    if (ref.req->state.load(std::memory_order_acquire) != DPDK_REQ_SENDING)
+      continue;
+    if (ref.task->isDone)
+      continue;
+    sendBudget -= dpdkProgressSendTask(ref.req, ref.task, sendBudget);
+  }
+
+  for (auto &ref : recvTasks) {
+    if (ref.req == NULL || ref.task == NULL)
+      continue;
+    if (ref.task->attachedDev != thread->dev)
+      continue;
+    if (ref.req->state.load(std::memory_order_acquire) != DPDK_REQ_RECEIVING)
+      continue;
+    dpdkProgressRecvTask(ref.req, ref.task);
+    dpdkTryFinishRecvAfterAck(ref.req);
   }
 }
 
@@ -1331,8 +1694,9 @@ static inline void dpdkProgressComms(struct dpdkPollThread *thread) {
 static int dpdkPollThreadMain(void *arg) {
   dpdkPollThread *thread = (dpdkPollThread *)arg;
   while (!thread->stopRequested) {
-    int got = dpdkPollRx(thread->portId);
-    dpdkProgressComms(thread);
+    int got = dpdkPollRx(thread);
+    dpdkProgressTasks(thread);
+    dpdkUpdatePollThreadLoad(thread);
     if (got == 0)
       rte_pause();
   }
@@ -1348,6 +1712,13 @@ static ncclResult_t dpdkStartPollThread(int dev) {
   thread->refCount = 0;
   thread->stopRequested = 0;
   thread->lcoreId = RTE_MAX_LCORE;
+  thread->sendTasks.clear();
+  thread->recvTasks.clear();
+  thread->busyQ16 = 0;
+  thread->txAttempts = 0;
+  thread->txDrops = 0;
+  thread->rxPkts = 0;
+  thread->lastLoadTsc = 0;
   if (rte_lcore_count() <= 1) {
     WARN("NET/DPDK : no available DPDK lcore for poll thread");
     return ncclSystemError;
@@ -1374,6 +1745,8 @@ static ncclResult_t dpdkStartPollThread(int dev) {
 
 // Acquire one user reference to an already-started poll worker.
 static ncclResult_t dpdkAcquirePollThread(int dev) {
+  if (dev < 0 || dev >= ncclNetDpdkIfs)
+    return ncclInvalidArgument;
   dpdkPollThread *thread = &dpdkPollThreads[dev];
   std::lock_guard<std::mutex> lock(thread->mutex);
   thread->refCount++;
@@ -1381,6 +1754,8 @@ static ncclResult_t dpdkAcquirePollThread(int dev) {
 }
 
 static ncclResult_t dpdkReleasePollThread(int dev) {
+  if (dev < 0 || dev >= ncclNetDpdkIfs)
+    return ncclInvalidArgument;
   dpdkPollThread *thread = &dpdkPollThreads[dev];
   std::lock_guard<std::mutex> lock(thread->mutex);
   if (thread->refCount <= 0) {
@@ -1391,32 +1766,142 @@ static ncclResult_t dpdkReleasePollThread(int dev) {
   return ncclSuccess;
 }
 
-// Bind/unbind communicators to a device poll thread.
-static void dpdkAttachCommToPollThread(struct ncclNetDpdkComm *comm) {
-  dpdkPollThread *thread = &dpdkPollThreads[comm->dev];
-  std::lock_guard<std::mutex> lock(thread->mutex);
-  thread->attachedComms.push_back(comm);
-  dpdkCommAcquire(comm);
+static ncclResult_t dpdkAttachSendTask(struct ncclNetDpdkRequest *req,
+                                       struct dpdkSendTask *task) {
+  if (req == NULL || task == NULL || req->comm == NULL)
+    return ncclInvalidArgument;
+  if (task->isAttached)
+    return ncclSuccess;
+  int dev = task->attachedDev;
+  NCCLCHECK(dpdkAcquirePollThread(dev));
+  dpdkPollThread *thread = &dpdkPollThreads[dev];
+  {
+    std::lock_guard<std::mutex> lock(thread->mutex);
+    thread->sendTasks.push_back({req, task});
+  }
+  task->isAttached = 1;
+  dpdkCommAcquire(req->comm);
+  return ncclSuccess;
 }
 
-static void dpdkDetachCommFromPollThread(struct ncclNetDpdkComm *comm) {
-  dpdkPollThread *thread = &dpdkPollThreads[comm->dev];
-  std::lock_guard<std::mutex> lock(thread->mutex);
-  auto &v = thread->attachedComms;
-  for (size_t i = 0; i < v.size(); ++i) {
-    if (v[i] == comm) {
-      v[i] = v.back();
-      v.pop_back();
-      break;
+static void dpdkDetachSendTask(struct ncclNetDpdkRequest *req,
+                               struct dpdkSendTask *task) {
+  if (req == NULL || task == NULL || req->comm == NULL || !task->isAttached)
+    return;
+  int dev = task->attachedDev;
+  bool releaseThreadRef = false;
+  if (dev >= 0 && dev < ncclNetDpdkIfs) {
+    dpdkPollThread *thread = &dpdkPollThreads[dev];
+    {
+      std::lock_guard<std::mutex> lock(thread->mutex);
+      auto &v = thread->sendTasks;
+      for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i].task == task && v[i].req == req) {
+          v[i] = v.back();
+          v.pop_back();
+          releaseThreadRef = true;
+          break;
+        }
+      }
+    }
+    if (releaseThreadRef)
+      (void)dpdkReleasePollThread(dev);
+  }
+  task->isAttached = 0;
+  dpdkCommRelease(req->comm);
+}
+
+static ncclResult_t dpdkAttachRecvTask(struct ncclNetDpdkRequest *req,
+                                       struct dpdkRecvTask *task) {
+  if (req == NULL || task == NULL || req->comm == NULL)
+    return ncclInvalidArgument;
+  if (task->isAttached)
+    return ncclSuccess;
+  int dev = task->attachedDev;
+  NCCLCHECK(dpdkAcquirePollThread(dev));
+  dpdkPollThread *thread = &dpdkPollThreads[dev];
+  {
+    std::lock_guard<std::mutex> lock(thread->mutex);
+    thread->recvTasks.push_back({req, task});
+  }
+  task->isAttached = 1;
+  dpdkCommAcquire(req->comm);
+  return ncclSuccess;
+}
+
+static void dpdkDetachRecvTask(struct ncclNetDpdkRequest *req,
+                               struct dpdkRecvTask *task) {
+  if (req == NULL || task == NULL || req->comm == NULL || !task->isAttached)
+    return;
+  int dev = task->attachedDev;
+  bool releaseThreadRef = false;
+  if (dev >= 0 && dev < ncclNetDpdkIfs) {
+    dpdkPollThread *thread = &dpdkPollThreads[dev];
+    {
+      std::lock_guard<std::mutex> lock(thread->mutex);
+      auto &v = thread->recvTasks;
+      for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i].task == task && v[i].req == req) {
+          v[i] = v.back();
+          v.pop_back();
+          releaseThreadRef = true;
+          break;
+        }
+      }
+    }
+    if (releaseThreadRef)
+      (void)dpdkReleasePollThread(dev);
+  }
+  task->isAttached = 0;
+  dpdkCommRelease(req->comm);
+}
+
+static ncclResult_t dpdkAttachRequestTasks(struct ncclNetDpdkRequest *req) {
+  if (req == NULL)
+    return ncclInvalidArgument;
+  if (req->op == NCCL_SOCKET_SEND) {
+    if (req->send.tasks == NULL)
+      return ncclSuccess;
+    for (int i = 0; i < req->numTasks; i++) {
+      ncclResult_t ret = dpdkAttachSendTask(req, req->send.tasks + i);
+      if (ret != ncclSuccess) {
+        dpdkDetachRequestTasks(req);
+        return ret;
+      }
+    }
+  } else if (req->op == NCCL_SOCKET_RECV) {
+    if (req->recv.tasks == NULL)
+      return ncclSuccess;
+    for (int i = 0; i < req->numTasks; i++) {
+      ncclResult_t ret = dpdkAttachRecvTask(req, req->recv.tasks + i);
+      if (ret != ncclSuccess) {
+        dpdkDetachRequestTasks(req);
+        return ret;
+      }
     }
   }
-  dpdkCommRelease(comm);
+  return ncclSuccess;
+}
+
+static void dpdkDetachRequestTasks(struct ncclNetDpdkRequest *req) {
+  if (req == NULL)
+    return;
+  if (req->op == NCCL_SOCKET_SEND) {
+    if (req->send.tasks == NULL)
+      return;
+    for (int i = 0; i < req->numTasks; i++)
+      dpdkDetachSendTask(req, req->send.tasks + i);
+  } else if (req->op == NCCL_SOCKET_RECV) {
+    if (req->recv.tasks == NULL)
+      return;
+    for (int i = 0; i < req->numTasks; i++)
+      dpdkDetachRecvTask(req, req->recv.tasks + i);
+  }
 }
 
 static ncclResult_t dpdkRegisterComm(struct ncclNetDpdkComm *comm) {
   std::lock_guard<std::mutex> lock(ncclNetDpdkCommMutex);
   dpdkActiveComms.push_back(comm);
-  dpdkAttachCommToPollThread(comm);
   return ncclSuccess;
 }
 
@@ -1425,7 +1910,6 @@ static ncclResult_t dpdkUnregisterComm(struct ncclNetDpdkComm *comm) {
   auto it = std::find(dpdkActiveComms.begin(), dpdkActiveComms.end(), comm);
   if (it != dpdkActiveComms.end())
     dpdkActiveComms.erase(it);
-  dpdkDetachCommFromPollThread(comm);
   return ncclSuccess;
 }
 
@@ -1447,9 +1931,13 @@ static ncclResult_t dpdkStopPollThread(int dev) {
   {
     std::lock_guard<std::mutex> lock(thread->mutex);
     thread->lcoreId = RTE_MAX_LCORE;
-    for (auto *comm : thread->attachedComms)
-      dpdkCommRelease(comm);
-    thread->attachedComms.clear();
+    thread->sendTasks.clear();
+    thread->recvTasks.clear();
+    thread->busyQ16 = 0;
+    thread->txAttempts = 0;
+    thread->txDrops = 0;
+    thread->rxPkts = 0;
+    thread->lastLoadTsc = 0;
   }
   return ncclSuccess;
 }
@@ -1566,6 +2054,7 @@ ncclResult_t ncclNetDpdkMakeVDevice(int *d, ncclNetVDeviceProps_t *props) {
   dev->portId = (int)portId;
   NCCLCHECK(ncclNetDpdkGetPciPath(vdevName, &dev->pciPath));
   NCCLCHECK(dpdkInitDataPort(dev));
+  NCCLCHECK(ncclNetDpdkGetSpeed(devIx, &dev->speedMbps));
   NCCLCHECK(dpdkStartPollThread(devIx));
 
   *d = devIx;
@@ -1580,11 +2069,11 @@ ncclResult_t ncclNetDpdkGetProperties(int dev, ncclNetProperties_t *props) {
   // Host pointer support only: no GPUDirect registration in this transport yet.
   props->name = ncclNetDpdkDevs[dev].devName;
   props->pciPath = ncclNetDpdkDevs[dev].pciPath;
+  props->speed = ncclNetDpdkDevs[dev].speedMbps;
   props->guid = dev;
   props->ptrSupport = NCCL_PTR_HOST;
   props->regIsGlobal = 0;
   props->forceFlush = 0;
-  NCCLCHECK(ncclNetDpdkGetSpeed(dev, &props->speed));
   props->latency = 0;
   props->port = 0;
   props->maxComms = 65536;
@@ -1705,7 +2194,6 @@ dpdk_hello_send:
   if (stage->ioOffset < (int)sizeof(hello))
     return ncclSuccess;
   NCCLCHECK(dpdkRegisterComm(comm));
-  NCCLCHECK(dpdkAcquirePollThread(dev));
   *sendComm = comm;
   return ncclSuccess;
 }
@@ -1765,7 +2253,6 @@ dpdk_hello_recv:
   rComm->ctrlSock = *sock;
   free(sock);
   NCCLCHECK(dpdkRegisterComm(rComm));
-  NCCLCHECK(dpdkAcquirePollThread(rComm->dev));
   *recvComm = rComm;
 
   stage->state = ncclNetDpdkCommStateStart;
@@ -1813,6 +2300,10 @@ ncclResult_t ncclNetDpdkTest(void *request, int *done, int *size) {
   // Control-plane progression entrypoint called by NCCL:
   // SEND: SEND_CTRL -> WAIT_READY -> SENDING
   // RECV: RECV_CTRL -> SEND_READY -> RECEIVING
+  // Handshake ownership:
+  // 1) Sender publishes SEND metadata + local lane candidates.
+  // 2) Receiver builds pair plan and replies READY with lane pairing.
+  // 3) Both sides map tasks to attachedDev/endpoint and attach tasks to poll threads.
   *done = 0;
   struct ncclNetDpdkRequest *r = (struct ncclNetDpdkRequest *)request;
   if (r == NULL) {
@@ -1825,6 +2316,14 @@ ncclResult_t ncclNetDpdkTest(void *request, int *done, int *size) {
     int state = r->state.load(std::memory_order_acquire);
     if (state == DPDK_REQ_SEND_CTRL) {
       if (r->ctrlMsgOffset == 0) {
+        // Build deterministic task geometry first so receiver can pair by taskId.
+        if (r->send.tasks == NULL && r->size > 0 && r->frameSize > 0) {
+          NCCLCHECK(dpdkBuildRequestTasks(r, r->frameSize, r->size,
+                                          NCCL_SOCKET_SEND));
+        }
+        // Advertise sender-side lane candidates to peer.
+        r->localLaneCount = (uint16_t)dpdkCollectLocalLanes(
+            comm, r->numTasks, r->localLanes, DPDK_MAX_CTRL_LANES);
         r->ctrlMsg.magic = DPDK_CTRL_MAGIC;
         r->ctrlMsg.version = DPDK_PROTO_VERSION;
         r->ctrlMsg.type = DPDK_CTRL_SEND;
@@ -1832,6 +2331,14 @@ ncclResult_t ncclNetDpdkTest(void *request, int *done, int *size) {
         r->ctrlMsg.dstReqId = 0;
         r->ctrlMsg.size = r->size;
         r->ctrlMsg.frameSize = (uint32_t)r->frameSize;
+        r->ctrlMsg.numTasks = (uint16_t)std::max(0, r->numTasks);
+        r->ctrlMsg.laneCount = r->localLaneCount;
+        memset(r->ctrlMsg.lanes, 0, sizeof(r->ctrlMsg.lanes));
+        for (int i = 0; i < r->localLaneCount; i++)
+          r->ctrlMsg.lanes[i] = r->localLanes[i];
+        r->ctrlMsg.pairCount = 0;
+        memset(r->ctrlMsg.pairs, 0, sizeof(r->ctrlMsg.pairs));
+        r->ctrlMsg.pairSeed = 0;
       }
       NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->ctrlSock,
                                    &r->ctrlMsg, sizeof(r->ctrlMsg),
@@ -1843,6 +2350,7 @@ ncclResult_t ncclNetDpdkTest(void *request, int *done, int *size) {
       state = DPDK_REQ_WAIT_READY;
     }
     if (state == DPDK_REQ_WAIT_READY) {
+      // Consume READY, import receiver lane/pair decision, then attach send tasks.
       NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->ctrlSock,
                                    &r->ctrlMsg, sizeof(r->ctrlMsg),
                                    &r->ctrlMsgOffset));
@@ -1856,8 +2364,33 @@ ncclResult_t ncclNetDpdkTest(void *request, int *done, int *size) {
         return ncclInvalidUsage;
       }
       r->peerReqId = r->ctrlMsg.srcReqId;
-      NCCLCHECK(dpdkBuildRequestTasks(r, r->frameSize, r->size,
-                                      NCCL_SOCKET_SEND));
+      int peerCount = 0;
+      dpdkCopyCtrlLanesFromMsg(&r->ctrlMsg, r->peerLanes, &peerCount);
+      r->peerLaneCount = (uint16_t)peerCount;
+      r->pairCount = std::min((uint16_t)DPDK_MAX_CTRL_PAIRS, r->ctrlMsg.pairCount);
+      r->pairWeightSum = 0;
+      for (int i = 0; i < r->pairCount; i++) {
+        r->pairs[i] = r->ctrlMsg.pairs[i];
+        r->pairWeightSum = (uint16_t)(r->pairWeightSum + std::max<int>(1, r->pairs[i].weight));
+      }
+      r->pairSeed = r->ctrlMsg.pairSeed;
+      // If load balance is disabled or peer returns no pair, force single-lane fallback.
+      if (!dpdkLbBalanceEnabled()) {
+        r->pairCount = 1;
+        r->pairs[0].sendLane = 0;
+        r->pairs[0].recvLane = 0;
+        r->pairs[0].weight = 1;
+        r->pairWeightSum = 1;
+      } else if (r->pairCount == 0) {
+        r->pairCount = 1;
+        r->pairs[0].sendLane = 0;
+        r->pairs[0].recvLane = 0;
+        r->pairs[0].weight = 1;
+        r->pairWeightSum = 1;
+      }
+      // Materialize per-task attachedDev/endpoint and register tasks to poll threads.
+      dpdkApplySendTaskPairing(r);
+      NCCLCHECK(dpdkAttachRequestTasks(r));
       r->isCompleted.store(0, std::memory_order_relaxed);
       if (r->numFrames == 0) {
         r->isCompleted.store(1, std::memory_order_release);
@@ -1867,10 +2400,12 @@ ncclResult_t ncclNetDpdkTest(void *request, int *done, int *size) {
     }
     if (state == DPDK_REQ_SENDING) {
       if (r->isCompleted.load(std::memory_order_acquire)) {
+        // Request is done: detach all task-thread bindings before slot reuse.
+        r->state.store(DPDK_REQ_UNUSED, std::memory_order_release);
+        dpdkDetachRequestTasks(r);
         if (size)
           *size = r->size;
         *done = 1;
-        r->state.store(DPDK_REQ_UNUSED, std::memory_order_release);
         r->inUse = 0;
         return ncclSuccess;
       }
@@ -1881,13 +2416,15 @@ ncclResult_t ncclNetDpdkTest(void *request, int *done, int *size) {
   if (r->op == NCCL_SOCKET_RECV) {
     int state = r->state.load(std::memory_order_acquire);
     if (state == DPDK_REQ_RECV_CTRL) {
+      // Receive SEND, validate metadata, then compute receiver-side pair plan.
       NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->ctrlSock,
                                    &r->ctrlMsg, sizeof(r->ctrlMsg),
                                    &r->ctrlMsgOffset));
       if (r->ctrlMsgOffset < (int)sizeof(r->ctrlMsg))
         return ncclSuccess;
       if (r->ctrlMsg.magic != DPDK_CTRL_MAGIC ||
-          r->ctrlMsg.version != DPDK_PROTO_VERSION) {
+          r->ctrlMsg.version != DPDK_PROTO_VERSION ||
+          r->ctrlMsg.type != DPDK_CTRL_SEND) {
         WARN("NET/DPDK : invalid ctrl SEND");
         return ncclInvalidUsage;
       }
@@ -1904,14 +2441,44 @@ ncclResult_t ncclNetDpdkTest(void *request, int *done, int *size) {
       r->peerReqId = r->ctrlMsg.srcReqId;
       r->size = (int)r->ctrlMsg.size;
       r->frameSize = (int)r->ctrlMsg.frameSize;
+      int peerCount = 0;
+      dpdkCopyCtrlLanesFromMsg(&r->ctrlMsg, r->peerLanes, &peerCount);
+      r->peerLaneCount = (uint16_t)peerCount;
       NCCLCHECK(dpdkBuildRequestTasks(r, r->frameSize, r->size,
                                       NCCL_SOCKET_RECV));
+      // Receiver chooses local candidates and computes lane-pair weights.
+      r->localLaneCount = (uint16_t)dpdkCollectLocalLanes(
+          comm, r->numTasks, r->localLanes, DPDK_MAX_CTRL_LANES);
+      if (dpdkLbBalanceEnabled()) {
+        r->pairCount = (uint16_t)dpdkBuildLanePairPlan(
+            r->peerLanes, r->peerLaneCount, r->localLanes, r->localLaneCount,
+            r->pairs, DPDK_MAX_CTRL_PAIRS, &r->pairWeightSum);
+      } else {
+        r->pairCount = 1;
+        r->pairWeightSum = 1;
+        r->pairs[0].sendLane = 0;
+        r->pairs[0].recvLane = 0;
+        r->pairs[0].weight = 1;
+      }
+      if (r->pairCount == 0) {
+        r->pairCount = 1;
+        r->pairs[0].sendLane = 0;
+        r->pairs[0].recvLane = 0;
+        r->pairs[0].weight = 1;
+        r->pairWeightSum = 1;
+      }
+      // Pair plan is now fixed; map recv tasks and attach them before READY reply.
+      r->pairSeed = dpdkHash32(r->reqId ^ (r->peerReqId * 0x9e3779b9U) ^
+                               (uint32_t)r->size);
+      dpdkApplyRecvTaskPairing(r);
+      NCCLCHECK(dpdkAttachRequestTasks(r));
       r->state.store(DPDK_REQ_SEND_READY, std::memory_order_release);
       r->ctrlMsgOffset = 0;
       state = DPDK_REQ_SEND_READY;
     }
     if (state == DPDK_REQ_SEND_READY) {
       if (r->ctrlMsgOffset == 0) {
+        // Reply READY with receiver-selected lane candidates + pair plan.
         r->ctrlMsg.magic = DPDK_CTRL_MAGIC;
         r->ctrlMsg.version = DPDK_PROTO_VERSION;
         r->ctrlMsg.type = DPDK_CTRL_READY;
@@ -1919,6 +2486,16 @@ ncclResult_t ncclNetDpdkTest(void *request, int *done, int *size) {
         r->ctrlMsg.dstReqId = r->peerReqId;
         r->ctrlMsg.size = r->size;
         r->ctrlMsg.frameSize = (uint32_t)r->frameSize;
+        r->ctrlMsg.numTasks = (uint16_t)std::max(0, r->numTasks);
+        r->ctrlMsg.laneCount = r->localLaneCount;
+        memset(r->ctrlMsg.lanes, 0, sizeof(r->ctrlMsg.lanes));
+        for (int i = 0; i < r->localLaneCount; i++)
+          r->ctrlMsg.lanes[i] = r->localLanes[i];
+        r->ctrlMsg.pairCount = r->pairCount;
+        memset(r->ctrlMsg.pairs, 0, sizeof(r->ctrlMsg.pairs));
+        for (int i = 0; i < r->pairCount; i++)
+          r->ctrlMsg.pairs[i] = r->pairs[i];
+        r->ctrlMsg.pairSeed = r->pairSeed;
       }
       NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->ctrlSock,
                                    &r->ctrlMsg, sizeof(r->ctrlMsg),
@@ -1934,10 +2511,12 @@ ncclResult_t ncclNetDpdkTest(void *request, int *done, int *size) {
     }
     if (state == DPDK_REQ_RECEIVING) {
       if (r->isCompleted.load(std::memory_order_acquire)) {
+        // Recv request is done: detach task-thread bindings before slot reuse.
+        r->state.store(DPDK_REQ_UNUSED, std::memory_order_release);
+        dpdkDetachRequestTasks(r);
         if (size)
           *size = r->size;
         *done = 1;
-        r->state.store(DPDK_REQ_UNUSED, std::memory_order_release);
         r->inUse = 0;
         return ncclSuccess;
       }
@@ -1965,8 +2544,14 @@ ncclResult_t ncclNetDpdkClose(void *opaqueComm) {
   struct ncclNetDpdkComm *comm = (struct ncclNetDpdkComm *)opaqueComm;
   if (comm) {
     comm->closing.store(1, std::memory_order_release);
+    for (int i = 0; i < DPDK_MAX_REQUESTS; i++) {
+      struct ncclNetDpdkRequest *req = comm->requests + i;
+      if (req->inUse) {
+        req->state.store(DPDK_REQ_UNUSED, std::memory_order_release);
+        dpdkDetachRequestTasks(req);
+      }
+    }
     dpdkUnregisterComm(comm);
-    NCCLCHECK(dpdkReleasePollThread(comm->dev));
     int ready;
     NCCLCHECK(ncclSocketReady(&comm->ctrlSock, &ready));
     if (ready)
