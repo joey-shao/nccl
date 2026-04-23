@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -21,10 +23,9 @@ struct Options {
   int dev = -1;       // set both sendDev/recvDev if unspecified
   int sendDev = -1;   // -1 => auto choose dev 0
   int recvDev = -1;   // -1 => auto choose dev 0
-  int vdeviceNum = 0; // number of virtual devices to create after init
   int timeoutMs = 10000;
   int taskBytes = 1 << 25; // bytes per task
-  int taskCount = 8;     // number of tasks
+  int taskCount = 1;     // number of tasks
   bool verbose = false;
   std::string pluginPath;
 };
@@ -33,17 +34,17 @@ static void usage(const char* prog) {
   std::cerr
       << "Usage: " << prog
       << " --plugin <path> [--dev <idx>] [--send-dev <idx>] [--recv-dev <idx>] "
-         "[--vdevice-num <num>] [--timeout-ms <ms>] "
+         "[--timeout-ms <ms>] "
          "[--task-bytes <bytes>] [--task-count <count>] "
          "[--verbose]\n"
       << "Examples:\n"
       << "  " << prog
       << " --plugin ext-net/dpdk/build/libnccl-net-dpdk.so --dev 0 "
-         "--vdevice-num 2 --timeout-ms 15000 --task-bytes 1048576 "
+         "--timeout-ms 15000 --task-bytes 1048576 "
          "--task-count 64 --verbose\n"
       << "  " << prog
       << " --plugin ext-net/dpdk/build/libnccl-net-dpdk.so "
-         "--send-dev 0 --recv-dev 1 --vdevice-num 2 --timeout-ms 20000 "
+         "--send-dev 0 --recv-dev 1 --timeout-ms 20000 "
          "--task-count 128 --verbose\n";
 }
 
@@ -67,8 +68,6 @@ static bool parseArgs(int argc, char** argv, Options* opt) {
       if (!parseInt(argv[++i], &opt->sendDev)) return false;
     } else if (a == "--recv-dev" && i + 1 < argc) {
       if (!parseInt(argv[++i], &opt->recvDev)) return false;
-    } else if (a == "--vdevice-num" && i + 1 < argc) {
-      if (!parseInt(argv[++i], &opt->vdeviceNum)) return false;
     } else if (a == "--timeout-ms" && i + 1 < argc) {
       if (!parseInt(argv[++i], &opt->timeoutMs)) return false;
     } else if (a == "--task-bytes" && i + 1 < argc) {
@@ -84,7 +83,7 @@ static bool parseArgs(int argc, char** argv, Options* opt) {
       return false;
     }
   }
-  return !opt->pluginPath.empty() && opt->timeoutMs > 0 && opt->vdeviceNum >= 0 &&
+  return !opt->pluginPath.empty() && opt->timeoutMs > 0 &&
          opt->taskBytes > 0 && opt->taskCount > 0;
 }
 
@@ -99,6 +98,11 @@ static double bytesToMB(size_t bytes) {
   return (double)bytes / (1024.0 * 1024.0);
 }
 
+static double throughputMBps(size_t bytes, double elapsedMs) {
+  double sec = elapsedMs / 1000.0;
+  return (sec > 0.0) ? (bytesToMB(bytes) / sec) : 0.0;
+}
+
 static bool equalPrefix(const std::vector<uint8_t>& a,
                         const std::vector<uint8_t>& b, size_t n) {
   if (a.size() < n || b.size() < n) return false;
@@ -108,7 +112,47 @@ static bool equalPrefix(const std::vector<uint8_t>& a,
 struct StepStatus {
   bool ok = false;
   std::string err;
-  double transferMs = 0.0; // pure transfer loop duration, excludes connect/listen
+  double transferMs = 0.0; // worker execution duration
+};
+
+// Reusable 2-party barrier to align send/recv task launch points.
+struct TwoThreadBarrier {
+  std::mutex mu;
+  std::condition_variable cv;
+  int arrived = 0;
+  uint64_t generation = 0;
+  bool broken = false;
+
+  bool wait(int timeoutMs) {
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    std::unique_lock<std::mutex> lock(mu);
+    if (broken) return false;
+    uint64_t gen = generation;
+    arrived++;
+    if (arrived == 2) {
+      arrived = 0;
+      generation++;
+      cv.notify_all();
+      return true;
+    }
+    while (!broken && generation == gen) {
+      if (cv.wait_until(lock, deadline) == std::cv_status::timeout) {
+        if (!broken && generation == gen) {
+          broken = true;
+          cv.notify_all();
+          return false;
+        }
+      }
+    }
+    return !broken;
+  }
+
+  void breakAll() {
+    std::lock_guard<std::mutex> lock(mu);
+    broken = true;
+    cv.notify_all();
+  }
 };
 
 struct LoadedPlugin {
@@ -212,6 +256,7 @@ static StepStatus recvWorker(ncclNet_t* net, void* recvComm,
                              std::vector<uint8_t>& recvBuf, size_t size, int tag,
                              int timeoutMs) {
   StepStatus st;
+  auto workerStart = std::chrono::steady_clock::now();
   void* recvReq = nullptr;
   auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
@@ -225,6 +270,9 @@ static StepStatus recvWorker(ncclNet_t* net, void* recvComm,
           net->irecv(recvComm, 1, &data, &len, &rtag, &mr, nullptr, &recvReq);
       if (r != ncclSuccess) {
         st.err = "irecv failed rc=" + std::to_string((int)r);
+        st.transferMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - workerStart)
+                            .count();
         return st;
       }
     }
@@ -233,20 +281,32 @@ static StepStatus recvWorker(ncclNet_t* net, void* recvComm,
     ncclResult_t r = net->test(recvReq, &done, &got);
     if (r != ncclSuccess) {
       st.err = "test(recv) failed rc=" + std::to_string((int)r);
+      st.transferMs = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - workerStart)
+                          .count();
       return st;
     }
     if (done) {
       if (got >= 0 && (size_t)got != size) {
         st.err = "recv size mismatch expected=" + std::to_string(size) +
                  " got=" + std::to_string(got);
+        st.transferMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - workerStart)
+                            .count();
         return st;
       }
       st.ok = true;
+      st.transferMs = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - workerStart)
+                          .count();
       return st;
     }
     usleep(200);
   }
   st.err = "recv timeout";
+  st.transferMs = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - workerStart)
+                      .count();
   return st;
 }
 
@@ -254,6 +314,7 @@ static StepStatus sendWorker(ncclNet_t* net, void* sendComm,
                              std::vector<uint8_t>& sendBuf, size_t size, int tag,
                              int timeoutMs) {
   StepStatus st;
+  auto workerStart = std::chrono::steady_clock::now();
   void* sendReq = nullptr;
   auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
@@ -264,6 +325,9 @@ static StepStatus sendWorker(ncclNet_t* net, void* sendComm,
                                   &sendReq);
       if (r != ncclSuccess) {
         st.err = "isend failed rc=" + std::to_string((int)r);
+        st.transferMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - workerStart)
+                            .count();
         return st;
       }
     }
@@ -272,20 +336,32 @@ static StepStatus sendWorker(ncclNet_t* net, void* sendComm,
     ncclResult_t r = net->test(sendReq, &done, &sent);
     if (r != ncclSuccess) {
       st.err = "test(send) failed rc=" + std::to_string((int)r);
+      st.transferMs = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - workerStart)
+                          .count();
       return st;
     }
     if (done) {
       if (sent >= 0 && (size_t)sent != size) {
         st.err = "send size mismatch expected=" + std::to_string(size) +
                  " sent=" + std::to_string(sent);
+        st.transferMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - workerStart)
+                            .count();
         return st;
       }
       st.ok = true;
+      st.transferMs = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - workerStart)
+                          .count();
       return st;
     }
     usleep(200);
   }
   st.err = "send timeout";
+  st.transferMs = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - workerStart)
+                      .count();
   return st;
 }
 
@@ -294,6 +370,20 @@ struct TransferTask {
   int tag;
   bool verbose;
 };
+
+static std::mutex gTaskPrintMutex;
+
+static void printTaskPerf(const char* role, size_t taskIndex,
+                          const TransferTask& task, double elapsedMs) {
+  std::lock_guard<std::mutex> lock(gTaskPrintMutex);
+  std::cout << std::fixed << std::setprecision(3)
+            << "  [" << role << "_TASK] idx=" << taskIndex
+            << " tag=" << task.tag
+            << " sizeMB=" << bytesToMB(task.size)
+            << " elapsed_ms=" << elapsedMs
+            << " throughput_MBps=" << throughputMBps(task.size, elapsedMs)
+            << std::defaultfloat << "\n";
+}
 
 static size_t maxTaskBytes(const std::vector<TransferTask>& tasks) {
   size_t maxBytes = 0;
@@ -315,64 +405,87 @@ static std::vector<TransferTask> buildUniformTasks(size_t taskBytes,
 
 static StepStatus sendThreadMain(ncclNet_t* net, void* ctx, int dev, void* handle,
                                  int timeoutMs, std::atomic<bool>* listenReady,
-                                 const std::vector<TransferTask>& tasks) {
+                                 const std::vector<TransferTask>& tasks,
+                                 TwoThreadBarrier* taskStartBarrier) {
   StepStatus st;
+  double sendWorkerTotalMs = 0.0;
   void* sendComm = nullptr;
   StepStatus conn =
       connectWorker(net, ctx, dev, handle, timeoutMs, listenReady, &sendComm);
-  if (!conn.ok) return conn;
+  if (!conn.ok) {
+    if (taskStartBarrier) taskStartBarrier->breakAll();
+    return conn;
+  }
 
   std::vector<uint8_t> sendBuf(maxTaskBytes(tasks));
-  auto transferStart = std::chrono::steady_clock::now();
-  for (const auto& task : tasks) {
+  for (size_t taskIndex = 0; taskIndex < tasks.size(); taskIndex++) {
+    const auto& task = tasks[taskIndex];
     fillPattern(sendBuf, task.tag, task.size);
+    if (taskStartBarrier && !taskStartBarrier->wait(timeoutMs)) {
+      st.err = "task start barrier failed in send path";
+      if (sendComm) net->closeSend(sendComm);
+      if (taskStartBarrier) taskStartBarrier->breakAll();
+      st.transferMs = sendWorkerTotalMs;
+      return st;
+    }
     StepStatus tx =
         sendWorker(net, sendComm, sendBuf, task.size, task.tag, timeoutMs);
+    sendWorkerTotalMs += tx.transferMs;
     if (!tx.ok) {
       tx.err += ", size=" + std::to_string(task.size) +
                 " tag=" + std::to_string(task.tag);
       if (sendComm) net->closeSend(sendComm);
-      tx.transferMs = std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - transferStart)
-                          .count();
+      if (taskStartBarrier) taskStartBarrier->breakAll();
+      tx.transferMs = sendWorkerTotalMs;
       return tx;
     }
+    printTaskPerf("SEND", taskIndex, task, tx.transferMs);
   }
-  auto transferEnd = std::chrono::steady_clock::now();
 
   net->closeSend(sendComm);
   st.ok = true;
-  st.transferMs =
-      std::chrono::duration<double, std::milli>(transferEnd - transferStart)
-          .count();
+  st.transferMs = sendWorkerTotalMs;
   return st;
 }
 
 static StepStatus recvThreadMain(ncclNet_t* net, void* ctx, int dev, void* handle,
                                  int timeoutMs, std::atomic<bool>* listenReady,
-                                 const std::vector<TransferTask>& tasks) {
+                                 const std::vector<TransferTask>& tasks,
+                                 TwoThreadBarrier* taskStartBarrier) {
   StepStatus st;
+  double recvWorkerTotalMs = 0.0;
   void* listenComm = nullptr;
   void* recvComm = nullptr;
   StepStatus conn = listenAcceptWorker(net, ctx, dev, handle, timeoutMs,
                                        listenReady, &listenComm, &recvComm);
-  if (!conn.ok) return conn;
+  if (!conn.ok) {
+    if (taskStartBarrier) taskStartBarrier->breakAll();
+    return conn;
+  }
 
   std::vector<uint8_t> recvBuf(maxTaskBytes(tasks));
   std::vector<uint8_t> expectBuf(maxTaskBytes(tasks));
-  auto transferStart = std::chrono::steady_clock::now();
-  for (const auto& task : tasks) {
+  for (size_t taskIndex = 0; taskIndex < tasks.size(); taskIndex++) {
+    const auto& task = tasks[taskIndex];
     std::memset(recvBuf.data(), 0, task.size);
+    if (taskStartBarrier && !taskStartBarrier->wait(timeoutMs)) {
+      st.err = "task start barrier failed in recv path";
+      if (recvComm) net->closeRecv(recvComm);
+      if (listenComm) net->closeListen(listenComm);
+      if (taskStartBarrier) taskStartBarrier->breakAll();
+      st.transferMs = recvWorkerTotalMs;
+      return st;
+    }
     StepStatus rx =
         recvWorker(net, recvComm, recvBuf, task.size, task.tag, timeoutMs);
+    recvWorkerTotalMs += rx.transferMs;
     if (!rx.ok) {
       rx.err += ", size=" + std::to_string(task.size) +
                 " tag=" + std::to_string(task.tag);
       if (recvComm) net->closeRecv(recvComm);
       if (listenComm) net->closeListen(listenComm);
-      rx.transferMs = std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - transferStart)
-                          .count();
+      if (taskStartBarrier) taskStartBarrier->breakAll();
+      rx.transferMs = recvWorkerTotalMs;
       return rx;
     }
     fillPattern(expectBuf, task.tag, task.size);
@@ -381,25 +494,16 @@ static StepStatus recvThreadMain(ncclNet_t* net, void* ctx, int dev, void* handl
                " tag=" + std::to_string(task.tag);
       if (recvComm) net->closeRecv(recvComm);
       if (listenComm) net->closeListen(listenComm);
-      st.transferMs = std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - transferStart)
-                          .count();
+      if (taskStartBarrier) taskStartBarrier->breakAll();
+      st.transferMs = recvWorkerTotalMs;
       return st;
     }
-    if (task.verbose) {
-      std::cout << std::fixed << std::setprecision(3)
-                << "  [OK] sizeMB=" << bytesToMB(task.size)
-                << " tag=" << task.tag << std::defaultfloat << "\n";
-    }
+    printTaskPerf("RECV", taskIndex, task, rx.transferMs);
   }
-  auto transferEnd = std::chrono::steady_clock::now();
-
   net->closeRecv(recvComm);
   net->closeListen(listenComm);
   st.ok = true;
-  st.transferMs =
-      std::chrono::duration<double, std::milli>(transferEnd - transferStart)
-          .count();
+  st.transferMs = recvWorkerTotalMs;
   return st;
 }
 
@@ -452,29 +556,6 @@ int main(int argc, char** argv) {
     return 1;
   }
   initialized = true;
-
-  if (opt.vdeviceNum > 0) {
-    if (net->makeVDevice == nullptr) {
-      std::cerr << "selected plugin does not support makeVDevice\n";
-      cleanup();
-      return 1;
-    }
-    for (int i = 0; i < opt.vdeviceNum; i++) {
-      int vdev = -1;
-      ncclNetVDeviceProps_t vProps{.ndevs = 0};
-      r = net->makeVDevice(&vdev, &vProps);
-      if (r != ncclSuccess) {
-        std::cerr << "makeVDevice failed at " << (i + 1) << "/"
-                  << opt.vdeviceNum << ", rc=" << (int)r << "\n";
-        cleanup();
-        return 1;
-      }
-      if (opt.verbose) {
-        std::cout << "Created Vdevice index=" << vdev << " (" << (i + 1)
-                  << "/" << opt.vdeviceNum << ")\n";
-      }
-    }
-  }
 
   int ndev = 0;
   r = net->devices(&ndev);
@@ -555,38 +636,34 @@ int main(int argc, char** argv) {
     char handle[NCCL_NET_HANDLE_MAXSIZE];
     std::memset(handle, 0, sizeof(handle));
     std::atomic<bool> listenReady(false);
+    TwoThreadBarrier taskStartBarrier;
     StepStatus sendStatus;
     StepStatus recvStatus;
-    auto scenarioStartTs = std::chrono::steady_clock::now();
 
     std::thread sendThread([&]() {
       sendStatus = sendThreadMain(net, ctx, sendDev, handle, opt.timeoutMs,
-                                  &listenReady, scenarioTasks);
+                                  &listenReady, scenarioTasks,
+                                  &taskStartBarrier);
     });
     std::thread recvThread([&]() {
       recvStatus = recvThreadMain(net, ctx, recvDev, handle, opt.timeoutMs,
-                                  &listenReady, scenarioTasks);
+                                  &listenReady, scenarioTasks,
+                                  &taskStartBarrier);
     });
-
 
     sendThread.join();
     recvThread.join();
-    auto scenarioEndTs = std::chrono::steady_clock::now();
 
     size_t totalBytes = 0;
     for (const auto& t : scenarioTasks) totalBytes += t.size;
     size_t bytesPerTask = scenarioTasks.empty() ? 0 : scenarioTasks.front().size;
-    double transferMs = std::max(sendStatus.transferMs, recvStatus.transferMs);
-    if (transferMs <= 0.0) {
-      transferMs = std::chrono::duration<double, std::milli>(scenarioEndTs -
-                                                              scenarioStartTs)
-                       .count();
-    }
-    double seconds = transferMs / 1000.0;
+    double sendWorkerMs = sendStatus.transferMs;
+    double recvWorkerMs = recvStatus.transferMs;
+    double totalTransferMs = std::max(sendWorkerMs, recvWorkerMs);
+    double seconds = totalTransferMs / 1000.0;
     double taskMB = bytesToMB(bytesPerTask);
     double totalMB = bytesToMB(totalBytes);
     double mbps = (seconds > 0.0) ? (totalMB / seconds) : 0.0;
-    double gbps = mbps / 1024.0;
 
     bool ok = sendStatus.ok && recvStatus.ok;
     if (!sendStatus.ok) std::cerr << "  send: " << sendStatus.err << "\n";
@@ -597,8 +674,10 @@ int main(int argc, char** argv) {
                 << "  [PERF] task_count=" << scenarioTasks.size()
                 << " task_mb=" << taskMB
                 << " total_mb=" << totalMB
-                << " transfer_elapsed_ms=" << transferMs
-                << " throughput_GBps=" << gbps
+                << " send_worker_ms=" << sendWorkerMs
+                << " recv_worker_ms=" << recvWorkerMs
+                << " transfer_elapsed_ms=" << totalTransferMs
+                << " throughput_MBps=" << mbps
                 << std::defaultfloat << "\n";
     } else {
       std::cout << "  [FAIL] " << name << "\n";
