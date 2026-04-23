@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -17,9 +18,13 @@
 static const char* kPluginSymbol = "ncclNetPlugin_v11";
 
 struct Options {
-  int dev = -1;       // -1 => auto choose dev 0
+  int dev = -1;       // set both sendDev/recvDev if unspecified
+  int sendDev = -1;   // -1 => auto choose dev 0
+  int recvDev = -1;   // -1 => auto choose dev 0
   int vdeviceNum = 0; // number of virtual devices to create after init
   int timeoutMs = 10000;
+  int taskBytes = 1 << 25; // bytes per task
+  int taskCount = 8;     // number of tasks
   bool verbose = false;
   std::string pluginPath;
 };
@@ -27,12 +32,19 @@ struct Options {
 static void usage(const char* prog) {
   std::cerr
       << "Usage: " << prog
-      << " --plugin <path> [--dev <idx>] [--vdevice-num <num>] "
-         "[--timeout-ms <ms>] [--verbose]\n"
+      << " --plugin <path> [--dev <idx>] [--send-dev <idx>] [--recv-dev <idx>] "
+         "[--vdevice-num <num>] [--timeout-ms <ms>] "
+         "[--task-bytes <bytes>] [--task-count <count>] "
+         "[--verbose]\n"
       << "Examples:\n"
       << "  " << prog
       << " --plugin ext-net/dpdk/build/libnccl-net-dpdk.so --dev 0 "
-         "--vdevice-num 2 --timeout-ms 15000 --verbose\n";
+         "--vdevice-num 2 --timeout-ms 15000 --task-bytes 1048576 "
+         "--task-count 64 --verbose\n"
+      << "  " << prog
+      << " --plugin ext-net/dpdk/build/libnccl-net-dpdk.so "
+         "--send-dev 0 --recv-dev 1 --vdevice-num 2 --timeout-ms 20000 "
+         "--task-count 128 --verbose\n";
 }
 
 static bool parseInt(const char* s, int* out) {
@@ -51,10 +63,18 @@ static bool parseArgs(int argc, char** argv, Options* opt) {
       opt->pluginPath = argv[++i];
     } else if (a == "--dev" && i + 1 < argc) {
       if (!parseInt(argv[++i], &opt->dev)) return false;
+    } else if (a == "--send-dev" && i + 1 < argc) {
+      if (!parseInt(argv[++i], &opt->sendDev)) return false;
+    } else if (a == "--recv-dev" && i + 1 < argc) {
+      if (!parseInt(argv[++i], &opt->recvDev)) return false;
     } else if (a == "--vdevice-num" && i + 1 < argc) {
       if (!parseInt(argv[++i], &opt->vdeviceNum)) return false;
     } else if (a == "--timeout-ms" && i + 1 < argc) {
       if (!parseInt(argv[++i], &opt->timeoutMs)) return false;
+    } else if (a == "--task-bytes" && i + 1 < argc) {
+      if (!parseInt(argv[++i], &opt->taskBytes)) return false;
+    } else if (a == "--task-count" && i + 1 < argc) {
+      if (!parseInt(argv[++i], &opt->taskCount)) return false;
     } else if (a == "--verbose") {
       opt->verbose = true;
     } else if (a == "-h" || a == "--help") {
@@ -64,14 +84,19 @@ static bool parseArgs(int argc, char** argv, Options* opt) {
       return false;
     }
   }
-  return !opt->pluginPath.empty() && opt->timeoutMs > 0 &&
-         opt->vdeviceNum >= 0;
+  return !opt->pluginPath.empty() && opt->timeoutMs > 0 && opt->vdeviceNum >= 0 &&
+         opt->taskBytes > 0 && opt->taskCount > 0;
 }
 
-static void fillPattern(std::vector<uint8_t>& buf, int seed) {
-  for (size_t i = 0; i < buf.size(); i++) {
+static void fillPattern(std::vector<uint8_t>& buf, int seed, size_t n) {
+  size_t len = std::min(buf.size(), n);
+  for (size_t i = 0; i < len; i++) {
     buf[i] = (uint8_t)((i * 131u + seed * 17u + 23u) & 0xff);
   }
+}
+
+static double bytesToMB(size_t bytes) {
+  return (double)bytes / (1024.0 * 1024.0);
 }
 
 static bool equalPrefix(const std::vector<uint8_t>& a,
@@ -83,6 +108,7 @@ static bool equalPrefix(const std::vector<uint8_t>& a,
 struct StepStatus {
   bool ok = false;
   std::string err;
+  double transferMs = 0.0; // pure transfer loop duration, excludes connect/listen
 };
 
 struct LoadedPlugin {
@@ -118,6 +144,7 @@ static void unloadPlugin(LoadedPlugin* plugin) {
     plugin->handle = nullptr;
   }
 }
+
 
 // connect()/accept() are non-blocking in the plugin contract.
 static StepStatus connectWorker(ncclNet_t* net, void* ctx, int dev, void* handle,
@@ -268,38 +295,62 @@ struct TransferTask {
   bool verbose;
 };
 
+static size_t maxTaskBytes(const std::vector<TransferTask>& tasks) {
+  size_t maxBytes = 0;
+  for (const auto& task : tasks) maxBytes = std::max(maxBytes, task.size);
+  return std::max<size_t>(1, maxBytes);
+}
+
+static std::vector<TransferTask> buildUniformTasks(size_t taskBytes,
+                                                   int taskCount, int tagBase,
+                                                   bool verbose) {
+  std::vector<TransferTask> tasks;
+  tasks.reserve((size_t)taskCount);
+  for (int i = 0; i < taskCount; i++) {
+    bool taskVerbose = verbose && i < 8;
+    tasks.push_back({taskBytes, tagBase + i, taskVerbose});
+  }
+  return tasks;
+}
+
 static StepStatus sendThreadMain(ncclNet_t* net, void* ctx, int dev, void* handle,
                                  int timeoutMs, std::atomic<bool>* listenReady,
-                                 const std::vector<TransferTask>& tasks,
-                                 size_t maxBytes) {
+                                 const std::vector<TransferTask>& tasks) {
   StepStatus st;
   void* sendComm = nullptr;
   StepStatus conn =
       connectWorker(net, ctx, dev, handle, timeoutMs, listenReady, &sendComm);
   if (!conn.ok) return conn;
 
-  std::vector<uint8_t> sendBuf(maxBytes ? maxBytes : 1);
+  std::vector<uint8_t> sendBuf(maxTaskBytes(tasks));
+  auto transferStart = std::chrono::steady_clock::now();
   for (const auto& task : tasks) {
-    fillPattern(sendBuf, task.tag);
+    fillPattern(sendBuf, task.tag, task.size);
     StepStatus tx =
         sendWorker(net, sendComm, sendBuf, task.size, task.tag, timeoutMs);
     if (!tx.ok) {
       tx.err += ", size=" + std::to_string(task.size) +
                 " tag=" + std::to_string(task.tag);
       if (sendComm) net->closeSend(sendComm);
+      tx.transferMs = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - transferStart)
+                          .count();
       return tx;
     }
   }
+  auto transferEnd = std::chrono::steady_clock::now();
 
   net->closeSend(sendComm);
   st.ok = true;
+  st.transferMs =
+      std::chrono::duration<double, std::milli>(transferEnd - transferStart)
+          .count();
   return st;
 }
 
 static StepStatus recvThreadMain(ncclNet_t* net, void* ctx, int dev, void* handle,
                                  int timeoutMs, std::atomic<bool>* listenReady,
-                                 const std::vector<TransferTask>& tasks,
-                                 size_t maxBytes) {
+                                 const std::vector<TransferTask>& tasks) {
   StepStatus st;
   void* listenComm = nullptr;
   void* recvComm = nullptr;
@@ -307,8 +358,9 @@ static StepStatus recvThreadMain(ncclNet_t* net, void* ctx, int dev, void* handl
                                        listenReady, &listenComm, &recvComm);
   if (!conn.ok) return conn;
 
-  std::vector<uint8_t> recvBuf(maxBytes ? maxBytes : 1);
-  std::vector<uint8_t> expectBuf(maxBytes ? maxBytes : 1);
+  std::vector<uint8_t> recvBuf(maxTaskBytes(tasks));
+  std::vector<uint8_t> expectBuf(maxTaskBytes(tasks));
+  auto transferStart = std::chrono::steady_clock::now();
   for (const auto& task : tasks) {
     std::memset(recvBuf.data(), 0, task.size);
     StepStatus rx =
@@ -318,24 +370,36 @@ static StepStatus recvThreadMain(ncclNet_t* net, void* ctx, int dev, void* handl
                 " tag=" + std::to_string(task.tag);
       if (recvComm) net->closeRecv(recvComm);
       if (listenComm) net->closeListen(listenComm);
+      rx.transferMs = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - transferStart)
+                          .count();
       return rx;
     }
-    fillPattern(expectBuf, task.tag);
+    fillPattern(expectBuf, task.tag, task.size);
     if (!equalPrefix(expectBuf, recvBuf, task.size)) {
       st.err = "payload mismatch, size=" + std::to_string(task.size) +
                " tag=" + std::to_string(task.tag);
       if (recvComm) net->closeRecv(recvComm);
       if (listenComm) net->closeListen(listenComm);
+      st.transferMs = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - transferStart)
+                          .count();
       return st;
     }
     if (task.verbose) {
-      std::cout << "  [OK] size=" << task.size << " tag=" << task.tag << "\n";
+      std::cout << std::fixed << std::setprecision(3)
+                << "  [OK] sizeMB=" << bytesToMB(task.size)
+                << " tag=" << task.tag << std::defaultfloat << "\n";
     }
   }
+  auto transferEnd = std::chrono::steady_clock::now();
 
   net->closeRecv(recvComm);
   net->closeListen(listenComm);
   st.ok = true;
+  st.transferMs =
+      std::chrono::duration<double, std::milli>(transferEnd - transferStart)
+          .count();
   return st;
 }
 
@@ -420,63 +484,131 @@ int main(int argc, char** argv) {
     cleanup();
     return 1;
   }
-  int dev = (opt.dev >= 0) ? opt.dev : 0;
-  if (dev < 0 || dev >= ndev) {
-    std::cerr << "invalid dev index " << dev << ", available [0.."
+  int defaultDev = (opt.dev >= 0) ? opt.dev : 0;
+  int sendDev = (opt.sendDev >= 0) ? opt.sendDev : defaultDev;
+  int recvDev = (opt.recvDev >= 0) ? opt.recvDev : defaultDev;
+  if (sendDev < 0 || sendDev >= ndev) {
+    std::cerr << "invalid send dev index " << sendDev << ", available [0.."
+              << (ndev - 1) << "]\n";
+    cleanup();
+    return 1;
+  }
+  if (recvDev < 0 || recvDev >= ndev) {
+    std::cerr << "invalid recv dev index " << recvDev << ", available [0.."
               << (ndev - 1) << "]\n";
     cleanup();
     return 1;
   }
 
-  ncclNetProperties_t props{};
-  r = net->getProperties(dev, &props);
+  ncclNetProperties_t sendProps{};
+  ncclNetProperties_t recvProps{};
+  r = net->getProperties(sendDev, &sendProps);
   if (r != ncclSuccess) {
-    std::cerr << "getProperties failed, rc=" << (int)r << "\n";
+    std::cerr << "getProperties(sendDev) failed, rc=" << (int)r << "\n";
     cleanup();
     return 1;
   }
-  std::cout << "Using dev " << dev
-            << " name=" << (props.name ? props.name : "<null>")
-            << " ptrSupport=" << props.ptrSupport
-            << " maxRecvs=" << props.maxRecvs
-            << " maxP2pBytes=" << props.maxP2pBytes << "\n";
-
-  size_t maxBytes = 1 << 20;
-  if (props.maxP2pBytes > 0 && props.maxP2pBytes < maxBytes) {
-    maxBytes = props.maxP2pBytes;
+  r = net->getProperties(recvDev, &recvProps);
+  if (r != ncclSuccess) {
+    std::cerr << "getProperties(recvDev) failed, rc=" << (int)r << "\n";
+    cleanup();
+    return 1;
   }
-  std::vector<size_t> sizes = {0, 1, 7, 64, 4096, 65536, maxBytes};
-  if (maxBytes < 65536) sizes = {0, 1, 7, 64, maxBytes};
+  std::cout << std::fixed << std::setprecision(3)
+            << "Using sendDev=" << sendDev
+            << " name=" << (sendProps.name ? sendProps.name : "<null>")
+            << " maxP2pMB=" << bytesToMB(sendProps.maxP2pBytes)
+            << std::defaultfloat << "\n";
+  std::cout << std::fixed << std::setprecision(3)
+            << "Using recvDev=" << recvDev
+            << " name=" << (recvProps.name ? recvProps.name : "<null>")
+            << " maxP2pMB=" << bytesToMB(recvProps.maxP2pBytes)
+            << std::defaultfloat << "\n";
 
-  std::vector<TransferTask> tasks;
-  int tag = 100;
-  for (size_t sz : sizes) {
-    tasks.push_back({sz, tag, opt.verbose});
-    tag++;
+  size_t maxBytes = 1 << 31;
+  if (sendProps.maxP2pBytes > 0 && sendProps.maxP2pBytes < maxBytes) {
+    maxBytes = sendProps.maxP2pBytes;
   }
+  if (recvProps.maxP2pBytes > 0 && recvProps.maxP2pBytes < maxBytes) {
+    maxBytes = recvProps.maxP2pBytes;
+  }
+  size_t taskBytes = std::min<size_t>((size_t)opt.taskBytes, maxBytes);
+  int taskCount = opt.taskCount;
+  if ((size_t)opt.taskBytes > maxBytes) {
+    std::cout << std::fixed << std::setprecision(3)
+              << "Requested taskMB=" << bytesToMB((size_t)opt.taskBytes)
+              << " exceeds maxP2pMB limit, clamp to " << bytesToMB(taskBytes)
+              << std::defaultfloat << "\n";
+  }
+  std::vector<TransferTask> tasks =
+      buildUniformTasks(taskBytes, taskCount, /*tagBase=*/100, opt.verbose);
+  std::cout << std::fixed << std::setprecision(3)
+            << "Transfer config: taskCount=" << taskCount
+            << " taskMB=" << bytesToMB(taskBytes)
+            << " totalMB=" << bytesToMB(taskBytes * (size_t)taskCount)
+            << std::defaultfloat << "\n";
 
-  size_t stress = std::min<size_t>(32768, maxBytes);
-  for (int i = 0; i < 32; i++) tasks.push_back({stress, tag + i, false});
+  auto runScenario = [&](const std::string& name,
+                         const std::vector<TransferTask>& scenarioTasks
+                         ) -> bool {
+    std::cout << "[TEST] " << name << "\n";
+    char handle[NCCL_NET_HANDLE_MAXSIZE];
+    std::memset(handle, 0, sizeof(handle));
+    std::atomic<bool> listenReady(false);
+    StepStatus sendStatus;
+    StepStatus recvStatus;
+    auto scenarioStartTs = std::chrono::steady_clock::now();
 
-  char handle[NCCL_NET_HANDLE_MAXSIZE];
-  std::memset(handle, 0, sizeof(handle));
-  std::atomic<bool> listenReady(false);
-  StepStatus sendStatus;
-  StepStatus recvStatus;
-  std::thread sendThread([&]() {
-    sendStatus = sendThreadMain(net, ctx, dev, handle, opt.timeoutMs,
-                                &listenReady, tasks, maxBytes);
-  });
-  std::thread recvThread([&]() {
-    recvStatus = recvThreadMain(net, ctx, dev, handle, opt.timeoutMs,
-                                &listenReady, tasks, maxBytes);
-  });
-  sendThread.join();
-  recvThread.join();
+    std::thread sendThread([&]() {
+      sendStatus = sendThreadMain(net, ctx, sendDev, handle, opt.timeoutMs,
+                                  &listenReady, scenarioTasks);
+    });
+    std::thread recvThread([&]() {
+      recvStatus = recvThreadMain(net, ctx, recvDev, handle, opt.timeoutMs,
+                                  &listenReady, scenarioTasks);
+    });
 
-  bool ok = sendStatus.ok && recvStatus.ok;
-  if (!sendStatus.ok) std::cerr << sendStatus.err << "\n";
-  if (!recvStatus.ok) std::cerr << recvStatus.err << "\n";
+
+    sendThread.join();
+    recvThread.join();
+    auto scenarioEndTs = std::chrono::steady_clock::now();
+
+    size_t totalBytes = 0;
+    for (const auto& t : scenarioTasks) totalBytes += t.size;
+    size_t bytesPerTask = scenarioTasks.empty() ? 0 : scenarioTasks.front().size;
+    double transferMs = std::max(sendStatus.transferMs, recvStatus.transferMs);
+    if (transferMs <= 0.0) {
+      transferMs = std::chrono::duration<double, std::milli>(scenarioEndTs -
+                                                              scenarioStartTs)
+                       .count();
+    }
+    double seconds = transferMs / 1000.0;
+    double taskMB = bytesToMB(bytesPerTask);
+    double totalMB = bytesToMB(totalBytes);
+    double mbps = (seconds > 0.0) ? (totalMB / seconds) : 0.0;
+    double gbps = mbps / 1024.0;
+
+    bool ok = sendStatus.ok && recvStatus.ok;
+    if (!sendStatus.ok) std::cerr << "  send: " << sendStatus.err << "\n";
+    if (!recvStatus.ok) std::cerr << "  recv: " << recvStatus.err << "\n";
+    if (ok) {
+      std::cout << "  [OK] " << name << "\n";
+      std::cout << std::fixed << std::setprecision(3)
+                << "  [PERF] task_count=" << scenarioTasks.size()
+                << " task_mb=" << taskMB
+                << " total_mb=" << totalMB
+                << " transfer_elapsed_ms=" << transferMs
+                << " throughput_GBps=" << gbps
+                << std::defaultfloat << "\n";
+    } else {
+      std::cout << "  [FAIL] " << name << "\n";
+    }
+    return ok;
+  };
+
+  bool ok = runScenario(
+      "performance transfer", tasks
+  );
 
   cleanup();
 

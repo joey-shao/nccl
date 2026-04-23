@@ -1,16 +1,16 @@
 .DEFAULT_GOAL: build
 
 BUILDDIR ?= $(CURDIR)/build
-TEST_BIN := $(BUILDDIR)/nccl-net-plugin-test
+PERF_TEST_BIN := $(BUILDDIR)/nccl-net-plugin-perf-test
 
-SRC_FILES := net_plugin_so_test.cc
+PERF_SRC := net_plugin_perf_test.cc
 
 CPPFLAGS += -I../example/nccl
 CXXFLAGS ?= -O3 -fPIC
 
-build: $(TEST_BIN)
+build: $(PERF_TEST_BIN)
 
-$(TEST_BIN): $(SRC_FILES)
+$(PERF_TEST_BIN): $(PERF_SRC)
 	@printf "Compiling  %-35s > %s\n" "$<" "$@"
 	@mkdir -p "$(BUILDDIR)"
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $^ $(LDLIBS)
