@@ -13,6 +13,7 @@ endif
 
 SRC_FILES := \
 	net_dpdk.cc \
+	net_dpdk_utils.cc \
 	ncdp.cc \
 	plugin_compat.cc \
 	socket_compat.cc

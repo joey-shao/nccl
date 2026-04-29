@@ -51,14 +51,17 @@
 
 执行顺序：
 
-1. `dpdkInitControlInterface()`
-   - 用 `ncclFindInterfaces` 找到 Linux 控制面网卡。
-2. `dpdkInitEal()`
-   - 从环境变量 `NCCL_DPDK_EAL` 解析参数并调用 `rte_eal_init`。
-3. `dpdkLoadDataIpConfig()`
+1. `dpdkLoadDataIpConfig()`
    - 从 `dpdknet.conf`（或 `NCCL_DPDK_NET_CONF` 指定路径）读取数据面 IPv4 列表。
+   - 解析必需的 `control_ip` / `data_ip` section；`control_ip` 值为空时表示默认选择第一个控制面网卡。
+2. `dpdkInitControlInterface()`
+   - 若 `control_ip` section 下写了 IPv4，选择拥有该 IPv4 的 Linux 控制面网卡。
+   - 若 `control_ip` section 下没有值，保留默认行为，用 `ncclFindInterfaces` 选择第一个 Linux 控制面网卡。
+3. `dpdkInitEal()`
+   - 从环境变量 `NCCL_DPDK_EAL` 解析参数并调用 `rte_eal_init`。
 4. `dpdkInitDataDevices()`
    - 枚举物理 DPDK 端口并调用 `dpdkInitDataPort()` 完成配置。
+   - link state 为 down 的物理端口会被忽略，不会占用 net device 序号或 `data_ip` 条目。
 5. `dpdkStartPollThread()`
    - 为每个已发现 device 启动一个常驻 poll thread。
 
@@ -71,19 +74,29 @@
 
 `dpdknet.conf` 文件格式：
 
-- 每行可写 1 个或多个 IPv4。
-- 分隔符支持空格、Tab、逗号。
+- 必须写 `control_ip` 和 `data_ip` 两个 section 标签。
+- `control_ip` 下一行可写 1 个 Linux 控制面 IPv4；也可以留空，表示使用默认第一个控制面网卡。
+- `data_ip` 下写数据面 IPv4，每行可写 1 个或多个 IPv4。
+- 数据面 IP 分隔符支持空格、Tab、逗号。
 - `#` 开头或行内 `#` 之后视为注释。
-- 第 `i` 个解析出的 IP 会分配给第 `i` 个 net device（包含后续创建的 vdevice）。
+- 第 `i` 个解析出的数据面 IP 会分配给第 `i` 个可用 net device（物理端口只包含 link-up 设备，另包含后续创建的 vdevice）。
 
 示例：
 
 ```conf
-# physical devices
-192.168.10.11
-192.168.10.12
+control_ip
+128.110.220.127
 
-# optional vdevices
+data_ip
+192.168.10.101, 192.168.10.102
+```
+
+如果想使用默认第一个控制面网卡，保留 `control_ip` 标签但不写值：
+
+```conf
+control_ip
+
+data_ip
 192.168.10.101, 192.168.10.102
 ```
 
@@ -196,7 +209,7 @@
 - `NCCL_DPDK_EAL`
   - 直接传给 `rte_eal_init` 的参数字符串。
 - `NCCL_DPDK_NET_CONF`
-  - 数据面 IP 配置文件路径，默认 `dpdknet.conf`。
+  - 控制面/数据面 IP 配置文件路径，默认 `dpdknet.conf`。
 
 ### 7.3 传输行为参数
 
@@ -206,14 +219,16 @@
   - 单个 request 允许的最大 task 数。
 - `NCCL_DPDK_MIN_TASK_FRAMES`（默认 4096）
   - 单个 task 的最小 frame 数；用于约束 task 数，避免 task 粒度过碎。
-- `NCCL_DPDK_ACK_EVERY`（默认 8）
-- `NCCL_DPDK_ACK_DELAY_US`（默认 10）
+- `NCCL_DPDK_ACK_EVERY`（默认 32）
+- `NCCL_DPDK_ACK_DELAY_US`（默认 1000）
+- `NCCL_DPDK_RETX_TIMEOUT_US`（默认 500000）
+  - DATA frame 发出后超过该时间仍未被累计 ACK 时，发送 task 会在自己的 progress 中周期性重发；设为 `0` 可关闭 DATA 重传。
 - `NCCL_DPDK_LB_BALANCE`（默认 0）
   - 负载均衡总开关；仅当该值非 0 时启用多网卡分流与 lane 配对。
 - `NCCL_DPDK_LB_BUSY_TASKS`（默认 8）
-  - 当请求首选 `dev` 的 in-flight task 数达到该阈值时，触发分流判定（需 `NCCL_DPDK_BALANCE!=0`）。
+  - 当请求首选 `dev` 的 in-flight task 数达到该阈值时，触发分流判定。
 - `NCCL_DPDK_LB_MIN_TASKS`（默认 4）
-  - 仅当 request 的 task 数不少于该值时才允许分流，避免小请求被过度切分（需 `NCCL_DPDK_BALANCE!=0`）。
+  - 仅当 request 的 task 数不少于该值时才允许分流，避免小请求被过度切分。
 
 ### 7.4 vdev 相关
 
@@ -223,7 +238,7 @@
 ## 8. 使用限制
 
 - 仅支持 IPv4 数据面。
-- `dpdknet.conf` 中的 IP 数量必须覆盖要使用的 net device（物理网卡 + vdevice）。
+- `dpdknet.conf` 中的数据面 IP 数量必须覆盖要使用的 net device（link-up 物理网卡 + vdevice）。
 - `regMr` 仅支持 `NCCL_PTR_HOST`。
 - 每端口固定使用 queue 0（RX/TX 各 1 队列）。
 - 生命周期上 `finalize` 会停止 poll threads，但仍未做完整 DPDK 全局反初始化（例如 EAL 级别资源回收）。
