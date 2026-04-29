@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "net.h"
+#include "test_log.h"
 
 static const char* kPluginSymbol = "ncclNetPlugin_v11";
 
@@ -549,7 +550,8 @@ int main(int argc, char** argv) {
 
   ncclNetCommConfig_t cfg{};
   cfg.trafficClass = NCCL_NET_TRAFFIC_CLASS_UNDEF;
-  ncclResult_t r = net->init(&ctx, /*commId=*/0x12345678ULL, &cfg, nullptr, nullptr);
+  ncclResult_t r = net->init(&ctx, /*commId=*/0x12345678ULL, &cfg,
+                             pluginTestLogFunction, nullptr);
   if (r != ncclSuccess) {
     std::cerr << "init failed, rc=" << (int)r << "\n";
     cleanup();

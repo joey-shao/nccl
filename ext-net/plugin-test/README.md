@@ -79,10 +79,6 @@ DPDK 测试，先在 receiver 节点运行：
 ```bash
 sudo -E ./run_receiver_sweep.sh \
   --plugin-type dpdk \
-  --net-conf ./net.conf \
-  --dev 0 \
-  --task-count 1 \
-  --timeout-ms 1000000 \
   --out ./results/receiver-dpdk.log
 ```
 
@@ -91,10 +87,6 @@ sudo -E ./run_receiver_sweep.sh \
 ```bash
 sudo -E ./run_sender_sweep.sh \
   --plugin-type dpdk \
-  --net-conf ./net.conf \
-  --dev 0 \
-  --task-count 1 \
-  --timeout-ms 1000000 \
   --out ./results/sender-dpdk.log
 ```
 
@@ -110,6 +102,6 @@ Socket 测试只需要把插件类型改成 `socket`：
 - `--plugin-type dpdk|socket`：选择默认插件路径。
 - `--plugin <path>`：覆盖插件 `.so` 路径。
 - `--min-bytes <bytes>` / `--max-bytes <bytes>`：调整测试范围。
-- `--factor <n>`：调整每档大小倍数，默认 `2`。
+- `--factor <n>`：调整每档大小倍数，默认 `4`。
 - `--task-count <count>`：每个 size 的 task 数。
 - `--out <path>`：结果日志路径。
