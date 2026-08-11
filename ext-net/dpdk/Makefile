@@ -6,6 +6,7 @@ PLUGIN_SO := $(BUILDDIR)/libnccl-net-dpdk.so
 
 DPDK_CFLAGS ?= $(shell pkg-config --cflags libdpdk 2>/dev/null)
 DPDK_LIBS ?= $(shell pkg-config --static --libs libdpdk 2>/dev/null)
+DPDK_FAULT_INJECT ?= 0
 
 ifeq ($(strip $(DPDK_CFLAGS) $(DPDK_LIBS)),)
 $(warning DPDK flags are empty. Set DPDK_CFLAGS/DPDK_LIBS if build fails.)
@@ -23,8 +24,12 @@ CPPFLAGS += \
 	-I../example/nccl \
 	$(DPDK_CFLAGS)
 
+ifeq ($(DPDK_FAULT_INJECT),1)
+CPPFLAGS += -DNCCL_DPDK_FAULT_INJECT=1
+endif
+
 CXXFLAGS ?= -O3 -fPIC
-LDFLAGS += -shared
+LDFLAGS += -shared -pthread
 LDLIBS += $(DPDK_LIBS)
 
 build: $(PLUGIN_SO)

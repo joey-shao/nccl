@@ -230,7 +230,24 @@ data_ip
 - `NCCL_DPDK_LB_MIN_TASKS`（默认 4）
   - 仅当 request 的 task 数不少于该值时才允许分流，避免小请求被过度切分。
 
-### 7.4 vdev 相关
+### 7.4 故障注入测试
+
+编译时设置 `DPDK_FAULT_INJECT=1` 会启用测试用的假网卡故障注入：
+
+```bash
+make DPDK_FAULT_INJECT=1
+```
+
+启用后，`dpdkCheckPollThreadLink()` 会在目标 net device 真实 link-up 时按周期主动上报一次本地故障，并让该设备的 poll thread sleep 一段时间，用于验证容错和 failover 路径。
+
+- `NCCL_DPDK_FAULT_INJECT_DEV`（默认 0）
+  - 注入故障的 net device 序号；设为 `-1` 表示所有 device 都注入。
+- `NCCL_DPDK_FAULT_INJECT_INTERVAL_MS`（默认 100）
+  - 相邻两次假故障上报的间隔；设为 `0` 可在已编译注入代码时临时关闭，实际触发粒度受 `NCCL_DPDK_FAULT_CHECK_MS` 和   `NCCL_DPDK_FAULT_INJECT_SLEEP_MS` 限制。
+- `NCCL_DPDK_FAULT_INJECT_SLEEP_MS`（默认 100）
+  - 每次假故障上报后 poll thread 的 sleep 时长。
+
+### 7.5 vdev 相关
 
 - `NCCL_DPDK_VDEV_PREFIX`（默认 `net_ring`）
 - `NCCL_DPDK_VDEV_ARGS`（可选）

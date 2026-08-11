@@ -13,6 +13,8 @@
 #include <arpa/inet.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -24,9 +26,11 @@
 #include <mutex>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -49,7 +53,8 @@
 #define DPDK_MAX_REQUESTS NCCL_NET_MAX_REQUESTS
 
 #define DPDK_CTRL_MAGIC 0x4e43444bU // "NCDK"
-#define DPDK_PROTO_VERSION 4
+#define DPDK_FAULT_MAGIC 0x4e434446U // "NCDF"
+#define DPDK_PROTO_VERSION 5
 
 #define DPDK_RX_BURST 32
 #define DPDK_TX_BURST 32
@@ -62,6 +67,10 @@
 #define DPDK_MAX_CTRL_LANES 2
 #define DPDK_MAX_CTRL_PAIRS 2
 
+#ifndef NCCL_DPDK_FAULT_INJECT
+#define NCCL_DPDK_FAULT_INJECT 0
+#endif
+
 // Runtime knobs used by this DPDK transport implementation.
 // Data plane is DPDK/UDP; control plane remains ncclSocket-based TCP.
 NCCL_DPDK_PARAM(DpdkFrameWindow, "DPDK_FRAME_WINDOW", 64)
@@ -73,12 +82,31 @@ NCCL_DPDK_PARAM(DpdkRetxTimeoutUs, "DPDK_RETX_TIMEOUT_US", 500000)
 NCCL_DPDK_PARAM(DpdkLbBalance, "DPDK_LB_BALANCE", 0)
 NCCL_DPDK_PARAM(DpdkLbBusyTasks, "DPDK_LB_BUSY_TASKS", 8)
 NCCL_DPDK_PARAM(DpdkLbMinTasks, "DPDK_LB_MIN_TASKS", 4)
+NCCL_DPDK_PARAM(DpdkFaultCheckMs, "DPDK_FAULT_CHECK_MS", 100)
+NCCL_DPDK_PARAM(DpdkFaultDownCount, "DPDK_FAULT_DOWN_COUNT", 3)
+NCCL_DPDK_PARAM(DpdkFaultSendTimeoutMs, "DPDK_FAULT_SEND_TIMEOUT_MS", 50)
+NCCL_DPDK_PARAM(DpdkFaultManagerPollMs, "DPDK_FAULT_MANAGER_POLL_MS", 100)
+#if NCCL_DPDK_FAULT_INJECT
+NCCL_DPDK_PARAM(DpdkFaultInjectDev, "DPDK_FAULT_INJECT_DEV", 0)
+NCCL_DPDK_PARAM(DpdkFaultInjectIntervalMs, "DPDK_FAULT_INJECT_INTERVAL_MS",
+                100)
+NCCL_DPDK_PARAM(DpdkFaultInjectSleepMs, "DPDK_FAULT_INJECT_SLEEP_MS", 100)
+#endif
 
 // Control-plane messages exchanged over ncclSocket.
 // SEND announces a new transfer, READY binds the peer request id.
 enum dpdkCtrlType {
   DPDK_CTRL_SEND = 1,
   DPDK_CTRL_READY = 2,
+};
+
+enum dpdkHelloChannel {
+  DPDK_HELLO_CHANNEL_CTRL = 1,
+  DPDK_HELLO_CHANNEL_FAULT = 2,
+};
+
+enum dpdkFaultType {
+  DPDK_FAULT_NOTIFY = 1,
 };
 
 typedef struct __attribute__((packed)) dpdkCtrlLane {
@@ -117,7 +145,25 @@ typedef struct __attribute__((packed)) dpdkHelloMsg {
   struct rte_ether_addr mac;
   uint32_t commId;
   uint32_t dataIp;
+  uint16_t channel;
+  uint16_t reserved;
 } dpdkHelloMsg;
+
+typedef struct __attribute__((packed)) dpdkFaultMsg {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t type;
+  uint32_t srcCommId;
+  uint32_t dstCommId;
+  uint32_t srcReqId;
+  uint32_t dstReqId;
+  uint32_t op;
+  uint32_t failedDev;
+  uint32_t newDev;
+  uint64_t epoch;
+  uint64_t taskMask;
+  dpdkCtrlLane newLane;
+} dpdkFaultMsg;
 
 struct ncclNetDpdkHandle;
 struct ncclNetDpdkComm;
@@ -222,14 +268,18 @@ struct dpdkRecvRequestState {
 enum ncclNetDpdkCommState {
   // Entry state before any socket progress.
   ncclNetDpdkCommStateStart = 0,
-  // Active connect path (client).
-  ncclNetDpdkCommStateConnect = 1,
-  // Client sends hello payload.
-  ncclNetDpdkCommStateHelloSend = 2,
+  // Active connect path (client) for ctrl socket.
+  ncclNetDpdkCommStateConnectCtrl = 1,
+  // Client sends ctrl hello payload.
+  ncclNetDpdkCommStateHelloSendCtrl = 2,
+  // Active connect path (client) for fault socket.
+  ncclNetDpdkCommStateConnectFault = 3,
+  // Client sends fault hello payload.
+  ncclNetDpdkCommStateHelloSendFault = 4,
   // Active accept path (server).
-  ncclNetDpdkCommStateAccept = 3,
+  ncclNetDpdkCommStateAccept = 5,
   // Server receives hello payload.
-  ncclNetDpdkCommStateHelloRecv = 4,
+  ncclNetDpdkCommStateHelloRecv = 6,
 };
 
 struct ncclNetDpdkCommStage {
@@ -238,6 +288,8 @@ struct ncclNetDpdkCommStage {
   struct ncclSocket *sock;
   struct ncclNetDpdkComm *comm;
   int ioOffset;
+  int acceptedChannelMask;
+  dpdkHelloMsg hello;
 };
 
 struct ncclNetDpdkHandle {
@@ -263,6 +315,8 @@ struct ncclNetDpdkRequest {
   dpdkCtrlMsg ctrlMsg;
   // Completion observed by ncclNetDpdkTest.
   std::atomic<int> isCompleted;
+  // Async terminal error observed by ncclNetDpdkTest.
+  std::atomic<int> errorCode;
   struct ncclNetDpdkComm *comm;
   // Common transfer geometry shared by send and recv paths.
   int frameSize;
@@ -310,6 +364,7 @@ struct ncclNetDpdkListenComm {
 
 struct ncclNetDpdkComm {
   struct ncclSocket ctrlSock;
+  struct ncclSocket faultSock;
   int dev;
   int cudaDev;
   int portId;
@@ -322,6 +377,9 @@ struct ncclNetDpdkComm {
   uint32_t remoteCommId;
   int maxPayload;
   uint32_t nextReqId;
+  int faultRxOffset;
+  uint64_t faultLastEpoch;
+  dpdkFaultMsg faultRxMsg;
   struct ncclNetDpdkRequest requests[DPDK_MAX_REQUESTS];
   std::atomic<int> refCount;
   std::atomic<int> closing;
@@ -366,6 +424,16 @@ struct dpdkPollThread {
   uint64_t txDrops;
   uint64_t rxPkts;
   uint64_t lastLoadTsc;
+  uint64_t lastLinkCheckTsc;
+  int linkDownCount;
+  int faultReported;
+#if NCCL_DPDK_FAULT_INJECT
+  uint64_t lastFaultInjectTsc;
+#endif
+};
+
+struct dpdkFaultEvent {
+  int failedDev;
 };
 
 // Process-local transport state.
@@ -393,10 +461,22 @@ static unsigned dpdkNextPollLcore = RTE_MAX_LCORE;
 static std::vector<uint32_t> ncclNetDpdkDataIps;
 // Per-device polling worker state and attachments.
 static dpdkPollThread dpdkPollThreads[DPDK_MAX_DEVS];
+// Local fault events raised by poll threads.
+static std::mutex dpdkFaultMutex;
+static std::condition_variable dpdkFaultCv;
+static std::vector<dpdkFaultEvent> dpdkFaultEvents;
+static std::thread dpdkFaultManagerThread;
+static std::atomic<int> dpdkFaultManagerRunning(0);
+static std::atomic<int> dpdkFaultStop(0);
+static std::atomic<uint64_t> dpdkFaultEpoch(1);
 
 static void dpdkReleaseRequestFrames(struct ncclNetDpdkRequest *r);
 static void dpdkDetachRequestTasks(struct ncclNetDpdkRequest *req);
 static ncclResult_t ncclNetDpdkGetSpeed(int dev, int *speed);
+static ncclResult_t dpdkStartFaultManager();
+static void dpdkStopFaultManager();
+static void dpdkRaiseLocalFaultEvent(int failedDev);
+static bool dpdkIsDevLinkUp(int dev);
 
 // Internal static helpers are ordered by responsibility:
 // 1) init / device discovery
@@ -690,6 +770,10 @@ static void dpdkInitCommDefaults(struct ncclNetDpdkComm *comm) {
   comm->dev = -1;
   comm->cudaDev = -1;
   comm->portId = -1;
+  comm->ctrlSock.fd = -1;
+  comm->faultSock.fd = -1;
+  comm->faultRxOffset = 0;
+  comm->faultLastEpoch = 0;
   comm->refCount.store(1, std::memory_order_relaxed);
 }
 
@@ -755,6 +839,7 @@ static void dpdkReleaseRequestFrames(struct ncclNetDpdkRequest *r) {
   r->send.tasks = NULL;
   r->recv.tasks = NULL;
   r->recv.recvDoneFrames = 0;
+  r->errorCode.store(0, std::memory_order_relaxed);
   r->frameSize = 0;
   r->numFrames = 0;
   r->numTasks = 0;
@@ -826,6 +911,7 @@ static ncclResult_t dpdkGetRequest(struct ncclNetDpdkComm *comm, int op,
       r->ctrlMsgOffset = 0;
       memset(&r->ctrlMsg, 0, sizeof(r->ctrlMsg));
       r->isCompleted.store(0, std::memory_order_relaxed);
+      r->errorCode.store(0, std::memory_order_relaxed);
       r->comm = comm;
       r->reqId = ++comm->nextReqId;
       if (r->reqId == 0)
@@ -1929,6 +2015,91 @@ static inline void dpdkUpdatePollThreadLoad(struct dpdkPollThread *thread) {
   thread->lastLoadTsc = now;
 }
 
+#if NCCL_DPDK_FAULT_INJECT
+static inline void dpdkMaybeInjectPollThreadFault(struct dpdkPollThread *thread,
+                                                  uint64_t now,
+                                                  uint64_t hz) {
+  int injectDev = ncclParamDpdkFaultInjectDev();
+  if (injectDev >= 0 && injectDev != thread->dev)
+    return;
+
+  bool hasTasks = false;
+  {
+    std::lock_guard<std::mutex> lock(thread->mutex);
+    hasTasks = !thread->sendTasks.empty() || !thread->recvTasks.empty();
+  }
+  if (!hasTasks) {
+    thread->lastFaultInjectTsc = 0;
+    return;
+  }
+
+  int intervalMs = ncclParamDpdkFaultInjectIntervalMs();
+  uint64_t injectEvery = ((uint64_t)intervalMs * hz) / 1000ULL;
+  if (injectEvery == 0)
+    injectEvery = 1;
+  if (thread->lastFaultInjectTsc == 0) {
+    thread->lastFaultInjectTsc = now;
+    return;
+  }
+  if (now - thread->lastFaultInjectTsc < injectEvery)
+    return;
+  thread->lastFaultInjectTsc = now;
+
+  int sleepMs = ncclParamDpdkFaultInjectSleepMs();
+
+  INFO(NCCL_NET,
+       "NET/DPDK : test fault injection dev=%d port=%d name=%s intervalMs=%d sleepMs=%d, scheduling failover",
+       thread->dev, thread->portId, ncclNetDpdkDevs[thread->dev].devName,
+       intervalMs, sleepMs);
+  dpdkRaiseLocalFaultEvent(thread->dev);
+  if (sleepMs > 0) {
+    uint64_t sleepUs = (uint64_t)sleepMs * 1000ULL;
+    if (sleepUs > UINT_MAX)
+      sleepUs = UINT_MAX;
+    rte_delay_us_sleep((unsigned int)sleepUs);
+  }
+}
+#endif
+
+static inline void dpdkCheckPollThreadLink(struct dpdkPollThread *thread) {
+  if (thread == NULL || thread->dev < 0 || thread->dev >= ncclNetDpdkIfs)
+    return;
+  uint64_t hz = dpdkTscHz ? dpdkTscHz : rte_get_tsc_hz();
+  uint64_t now = rte_get_tsc_cycles();
+  int checkMs = ncclParamDpdkFaultCheckMs();
+  if (checkMs <= 0)
+    checkMs = 1;
+  uint64_t checkEvery = ((uint64_t)checkMs * hz) / 1000ULL;
+  if (checkEvery == 0)
+    checkEvery = 1;
+  if (thread->lastLinkCheckTsc != 0 &&
+      now - thread->lastLinkCheckTsc < checkEvery)
+    return;
+  thread->lastLinkCheckTsc = now;
+
+  if (dpdkIsDevLinkUp(thread->dev)) {
+    thread->linkDownCount = 0;
+    thread->faultReported = 0;
+#if NCCL_DPDK_FAULT_INJECT
+    dpdkMaybeInjectPollThreadFault(thread, now, hz);
+#endif
+    return;
+  }
+
+  thread->linkDownCount++;
+  int downNeed = ncclParamDpdkFaultDownCount();
+  if (downNeed <= 0)
+    downNeed = 1;
+  if (thread->linkDownCount >= downNeed && !thread->faultReported) {
+    thread->faultReported = 1;
+    INFO(NCCL_NET,
+         "NET/DPDK : fault detected dev=%d port=%d name=%s downCount=%d, scheduling failover",
+         thread->dev, thread->portId, ncclNetDpdkDevs[thread->dev].devName,
+         thread->linkDownCount);
+    dpdkRaiseLocalFaultEvent(thread->dev);
+  }
+}
+
 static int dpdkPollRx(struct dpdkPollThread *thread) {
   struct rte_mbuf *mbufs[DPDK_RX_BURST];
   int nb = rte_eth_rx_burst((uint16_t)thread->portId, 0, mbufs, DPDK_RX_BURST);
@@ -1988,6 +2159,7 @@ static int dpdkPollThreadMain(void *arg) {
     int got = dpdkPollRx(thread);
     dpdkProgressTasks(thread);
     dpdkUpdatePollThreadLoad(thread);
+    dpdkCheckPollThreadLink(thread);
     if (got == 0)
       rte_pause();
   }
@@ -2010,6 +2182,12 @@ static ncclResult_t dpdkStartPollThread(int dev) {
   thread->txDrops = 0;
   thread->rxPkts = 0;
   thread->lastLoadTsc = 0;
+  thread->lastLinkCheckTsc = 0;
+  thread->linkDownCount = 0;
+  thread->faultReported = 0;
+#if NCCL_DPDK_FAULT_INJECT
+  thread->lastFaultInjectTsc = 0;
+#endif
   if (rte_lcore_count() <= 1) {
     WARN("NET/DPDK : no available DPDK lcore for poll thread");
     return ncclSystemError;
@@ -2192,6 +2370,493 @@ static void dpdkDetachRequestTasks(struct ncclNetDpdkRequest *req) {
   }
 }
 
+static void dpdkMarkRequestFailed(struct ncclNetDpdkRequest *req,
+                                  ncclResult_t err) {
+  if (req == NULL)
+    return;
+  req->errorCode.store((int)err, std::memory_order_release);
+  req->isCompleted.store(1, std::memory_order_release);
+  req->state.store(DPDK_REQ_UNUSED, std::memory_order_release);
+  dpdkDetachRequestTasks(req);
+}
+
+static bool dpdkIsDevLinkUp(int dev) {
+  if (dev < 0 || dev >= ncclNetDpdkIfs)
+    return false;
+  int portId = ncclNetDpdkDevs[dev].portId;
+  if (portId < 0)
+    return false;
+  struct rte_eth_link link;
+  memset(&link, 0, sizeof(link));
+  rte_eth_link_get_nowait((uint16_t)portId, &link);
+  return link.link_status != RTE_ETH_LINK_DOWN;
+}
+
+static int dpdkSelectFailoverDev(int failedDev) {
+  int bestDev = -1;
+  uint16_t bestBusy = UINT16_MAX;
+  for (int dev = 0; dev < ncclNetDpdkIfs; dev++) {
+    if (dev == failedDev)
+      continue;
+    if (!dpdkIsDevLinkUp(dev))
+      continue;
+    uint16_t busy = dpdkGetThreadBusyQ16(dev);
+    if (bestDev < 0 || busy < bestBusy) {
+      bestDev = dev;
+      bestBusy = busy;
+    }
+  }
+  return bestDev;
+}
+
+static inline const char *dpdkOpName(int op) {
+  if (op == NCCL_SOCKET_SEND)
+    return "SEND";
+  if (op == NCCL_SOCKET_RECV)
+    return "RECV";
+  return "UNKNOWN";
+}
+
+static void dpdkSwitchCommPrimaryDev(struct ncclNetDpdkComm *comm, int newDev) {
+  if (comm == NULL || newDev < 0 || newDev >= ncclNetDpdkIfs)
+    return;
+  int oldDev = comm->dev;
+  comm->dev = newDev;
+  comm->portId = ncclNetDpdkDevs[newDev].portId;
+  comm->pool = ncclNetDpdkDevs[newDev].pool;
+  comm->maxPayload = ncdpComputeMaxPayload(ncclNetDpdkDevs[newDev].mtu);
+  comm->localIp = ncclNetDpdkDevs[newDev].addr.sin.sin_addr.s_addr;
+  rte_ether_addr_copy(&ncclNetDpdkDevs[newDev].mac, &comm->localMac);
+  INFO(NCCL_NET,
+       "NET/DPDK : fault failover switched commId=%u primary dev %d->%d port=%d",
+       comm->commId, oldDev, newDev, comm->portId);
+}
+
+static void dpdkResetSendTaskWindow(struct dpdkSendTask *task) {
+  if (task == NULL)
+    return;
+  task->sndNxt = task->sndUna;
+  task->inflight = 0;
+  if (task->frames && task->frameSlots > 0) {
+    for (int i = 0; i < task->frameSlots; i++) {
+      task->frames[i].seq = DPDK_INVALID_SEQ;
+      task->frames[i].lastTxTsc = 0;
+      task->frames[i].txCount = 0;
+      task->frames[i].len = 0;
+      task->frames[i].state = DPDK_FRAME_EMPTY;
+    }
+  }
+  if (task->ackedBitmap && task->ackedBitmapWords > 0)
+    memset(task->ackedBitmap, 0, task->ackedBitmapWords * sizeof(uint64_t));
+}
+
+static ncclResult_t dpdkMigrateSendTaskLocal(struct ncclNetDpdkRequest *req,
+                                             struct dpdkSendTask *task,
+                                             int newDev) {
+  if (req == NULL || task == NULL || req->comm == NULL || newDev < 0 ||
+      newDev >= ncclNetDpdkIfs)
+    return ncclInvalidArgument;
+  if (task->attachedDev == newDev)
+    return ncclSuccess;
+
+  int oldDev = task->attachedDev;
+  struct rte_ether_addr remoteMac = task->endpoint.remoteMac;
+  uint32_t remoteIp = task->endpoint.remoteIp;
+  if (task->isAttached)
+    dpdkDetachSendTask(req, task);
+  task->attachedDev = newDev;
+  dpdkInitTaskEndpointFromDev(&task->endpoint, newDev, &remoteMac, remoteIp);
+  task->attachedDev = newDev;
+  NCCLCHECK(dpdkAttachSendTask(req, task));
+  dpdkResetSendTaskWindow(task);
+  INFO(NCCL_NET,
+       "NET/DPDK : migrated SEND task commId=%u reqId=%u peerReqId=%u taskId=%u dev %d->%d sndUna=%u sndNxt=%u completed=%d/%d",
+       req->comm->commId, req->reqId, req->peerReqId, task->taskId, oldDev,
+       newDev, task->sndUna, task->sndNxt, task->completedFrames,
+       task->numFrames);
+  return ncclSuccess;
+}
+
+static ncclResult_t dpdkMigrateRecvTaskLocal(struct ncclNetDpdkRequest *req,
+                                             struct dpdkRecvTask *task,
+                                             int newDev) {
+  if (req == NULL || task == NULL || req->comm == NULL || newDev < 0 ||
+      newDev >= ncclNetDpdkIfs)
+    return ncclInvalidArgument;
+  if (task->attachedDev == newDev)
+    return ncclSuccess;
+
+  int oldDev = task->attachedDev;
+  struct rte_ether_addr remoteMac = task->endpoint.remoteMac;
+  uint32_t remoteIp = task->endpoint.remoteIp;
+  if (task->isAttached)
+    dpdkDetachRecvTask(req, task);
+  task->attachedDev = newDev;
+  dpdkInitTaskEndpointFromDev(&task->endpoint, newDev, &remoteMac, remoteIp);
+  task->attachedDev = newDev;
+  NCCLCHECK(dpdkAttachRecvTask(req, task));
+  INFO(NCCL_NET,
+       "NET/DPDK : migrated RECV task commId=%u reqId=%u peerReqId=%u taskId=%u dev %d->%d rcvNxt=%u completed=%d/%d",
+       req->comm->commId, req->reqId, req->peerReqId, task->taskId, oldDev,
+       newDev, task->rcvNxt, task->completedFrames, task->numFrames);
+  return ncclSuccess;
+}
+
+static bool dpdkSendFaultMsg(struct ncclNetDpdkComm *comm,
+                             const dpdkFaultMsg *msg) {
+  if (comm == NULL || msg == NULL || comm->faultSock.fd < 0)
+    return false;
+  int timeoutMs = ncclParamDpdkFaultSendTimeoutMs();
+  if (timeoutMs <= 0)
+    timeoutMs = 1;
+  int offset = 0;
+  int closed = 0;
+  auto start = std::chrono::steady_clock::now();
+  while (offset < (int)sizeof(*msg) &&
+         !dpdkFaultStop.load(std::memory_order_relaxed)) {
+    ncclResult_t ret =
+        ncclSocketProgress(NCCL_SOCKET_SEND, &comm->faultSock, (void *)msg,
+                           sizeof(*msg), &offset, &closed);
+    if (ret != ncclSuccess || closed)
+      return false;
+    if (offset < (int)sizeof(*msg)) {
+      auto now = std::chrono::steady_clock::now();
+      int elapsed = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - start)
+                        .count();
+      if (elapsed >= timeoutMs)
+        return false;
+      usleep(200);
+    }
+  }
+  return offset == (int)sizeof(*msg);
+}
+
+static inline void dpdkStoreFaultLane(dpdkFaultMsg *msg,
+                                      const dpdkCtrlLane *lane) {
+  memcpy((char *)msg + offsetof(dpdkFaultMsg, newLane), lane, sizeof(*lane));
+}
+
+static inline void dpdkLoadFaultLane(const dpdkFaultMsg *msg,
+                                     dpdkCtrlLane *lane) {
+  memcpy(lane, (const char *)msg + offsetof(dpdkFaultMsg, newLane),
+         sizeof(*lane));
+}
+
+static void dpdkFillFaultMsg(struct ncclNetDpdkComm *comm,
+                             struct ncclNetDpdkRequest *req, int failedDev,
+                             int newDev, uint64_t taskMask,
+                             dpdkFaultMsg *msg) {
+  memset(msg, 0, sizeof(*msg));
+  msg->magic = DPDK_FAULT_MAGIC;
+  msg->version = DPDK_PROTO_VERSION;
+  msg->type = DPDK_FAULT_NOTIFY;
+  msg->srcCommId = comm->commId;
+  msg->dstCommId = comm->remoteCommId;
+  msg->srcReqId = req->reqId;
+  msg->dstReqId = req->peerReqId;
+  msg->op = (uint32_t)req->op;
+  msg->failedDev = (uint32_t)std::max(0, failedDev);
+  msg->newDev = (uint32_t)std::max(0, newDev);
+  msg->epoch = dpdkFaultEpoch.fetch_add(1, std::memory_order_relaxed);
+  msg->taskMask = taskMask;
+
+  dpdkCtrlLane lane;
+  dpdkBuildCtrlLaneFromDev(newDev, &lane);
+  dpdkStoreFaultLane(msg, &lane);
+  INFO(NCCL_NET,
+       "NET/DPDK : prepared fault notify commId=%u remoteCommId=%u op=%s reqId=%u peerReqId=%u failedDev=%d newDev=%d taskMask=0x%016llx epoch=%llu",
+       comm->commId, comm->remoteCommId, dpdkOpName(req->op), req->reqId,
+       req->peerReqId, failedDev, newDev, (unsigned long long)taskMask,
+       (unsigned long long)msg->epoch);
+}
+
+static void dpdkApplyRemoteFault(struct ncclNetDpdkComm *comm,
+                                 const dpdkFaultMsg *msg) {
+  if (comm == NULL || msg == NULL)
+    return;
+  std::lock_guard<std::mutex> lock(ncclNetDpdkCommMutex);
+  if (comm->closing.load(std::memory_order_acquire))
+    return;
+  if (msg->magic != DPDK_FAULT_MAGIC || msg->version != DPDK_PROTO_VERSION ||
+      msg->type != DPDK_FAULT_NOTIFY || msg->dstCommId != comm->commId ||
+      msg->srcCommId != comm->remoteCommId) {
+    return;
+  }
+  if (msg->epoch <= comm->faultLastEpoch)
+    return;
+  comm->faultLastEpoch = msg->epoch;
+
+  dpdkCtrlLane lane;
+  dpdkLoadFaultLane(msg, &lane);
+  comm->remoteMac = lane.mac;
+  comm->remoteIp = lane.dataIp;
+
+  INFO(NCCL_NET,
+       "NET/DPDK : applying remote fault commId=%u remoteCommId=%u op=%s localReqId=%u remoteReqId=%u failedDev=%u newDev=%u taskMask=0x%016llx epoch=%llu",
+       comm->commId, comm->remoteCommId, dpdkOpName((int)msg->op),
+       msg->dstReqId, msg->srcReqId, msg->failedDev, msg->newDev,
+       (unsigned long long)msg->taskMask, (unsigned long long)msg->epoch);
+
+  if (msg->taskMask == 0)
+    return;
+
+  if ((int)msg->op == NCCL_SOCKET_SEND) {
+    struct ncclNetDpdkRequest *req =
+        dpdkFindRequestByReqId(comm, msg->dstReqId, DPDK_REQ_RECEIVING);
+    if (req == NULL || req->recv.tasks == NULL)
+      return;
+    for (int i = 0; i < req->numTasks && i < 64; i++) {
+      if (((msg->taskMask >> i) & 1ull) == 0ull)
+        continue;
+      struct dpdkRecvTask *task = req->recv.tasks + i;
+      task->endpoint.remoteMac = lane.mac;
+      task->endpoint.remoteIp = lane.dataIp;
+      INFO(NCCL_NET,
+           "NET/DPDK : remote fault updated RECV task commId=%u reqId=%u peerReqId=%u taskId=%u remoteDev=%u newRemoteDev=%u rcvNxt=%u completed=%d/%d",
+           comm->commId, req->reqId, req->peerReqId, task->taskId,
+           msg->failedDev, msg->newDev, task->rcvNxt, task->completedFrames,
+           task->numFrames);
+    }
+    return;
+  }
+
+  if ((int)msg->op == NCCL_SOCKET_RECV) {
+    struct ncclNetDpdkRequest *req =
+        dpdkFindRequestByReqId(comm, msg->dstReqId, DPDK_REQ_SENDING);
+    if (req == NULL || req->send.tasks == NULL)
+      return;
+    for (int i = 0; i < req->numTasks && i < 64; i++) {
+      if (((msg->taskMask >> i) & 1ull) == 0ull)
+        continue;
+      struct dpdkSendTask *task = req->send.tasks + i;
+      task->endpoint.remoteMac = lane.mac;
+      task->endpoint.remoteIp = lane.dataIp;
+      dpdkResetSendTaskWindow(task);
+      INFO(NCCL_NET,
+           "NET/DPDK : remote fault retargeted SEND task commId=%u reqId=%u peerReqId=%u taskId=%u remoteDev=%u newRemoteDev=%u sndUna=%u sndNxt=%u completed=%d/%d",
+           comm->commId, req->reqId, req->peerReqId, task->taskId,
+           msg->failedDev, msg->newDev, task->sndUna, task->sndNxt,
+           task->completedFrames, task->numFrames);
+    }
+  }
+}
+
+static void dpdkProgressFaultRx(struct ncclNetDpdkComm *comm) {
+  if (comm == NULL || comm->faultSock.fd < 0 ||
+      comm->closing.load(std::memory_order_acquire))
+    return;
+
+  for (int i = 0; i < 8; i++) {
+    int closed = 0;
+    ncclResult_t ret = ncclSocketProgress(
+        NCCL_SOCKET_RECV, &comm->faultSock, &comm->faultRxMsg,
+        sizeof(comm->faultRxMsg), &comm->faultRxOffset, &closed);
+    if (ret != ncclSuccess || closed) {
+      WARN("NET/DPDK : fault socket closed/errored for commId=%u",
+           comm->commId);
+      (void)ncclSocketClose(&comm->faultSock);
+      comm->faultRxOffset = 0;
+      return;
+    }
+    if (comm->faultRxOffset < (int)sizeof(comm->faultRxMsg))
+      break;
+    dpdkApplyRemoteFault(comm, &comm->faultRxMsg);
+    comm->faultRxOffset = 0;
+  }
+}
+
+static void dpdkCollectActiveComms(std::vector<ncclNetDpdkComm *> *out) {
+  if (out == NULL)
+    return;
+  std::lock_guard<std::mutex> lock(ncclNetDpdkCommMutex);
+  out->clear();
+  out->reserve(dpdkActiveComms.size());
+  for (auto *comm : dpdkActiveComms) {
+    dpdkCommAcquire(comm);
+    out->push_back(comm);
+  }
+}
+
+static void dpdkReleaseActiveComms(std::vector<ncclNetDpdkComm *> *comms) {
+  if (comms == NULL)
+    return;
+  for (auto *comm : *comms)
+    dpdkCommRelease(comm);
+  comms->clear();
+}
+
+static void dpdkHandleLocalFaultEvent(const dpdkFaultEvent &ev) {
+  std::vector<ncclNetDpdkComm *> comms;
+  dpdkCollectActiveComms(&comms);
+  for (auto *comm : comms) {
+    if (comm == NULL || comm->closing.load(std::memory_order_acquire))
+      continue;
+
+    int backupDev = dpdkSelectFailoverDev(ev.failedDev);
+    if (backupDev >= 0 && comm->dev == ev.failedDev)
+      dpdkSwitchCommPrimaryDev(comm, backupDev);
+
+    for (int ri = 0; ri < DPDK_MAX_REQUESTS; ri++) {
+      struct ncclNetDpdkRequest *req = comm->requests + ri;
+      if (!req->inUse || req->peerReqId == 0)
+        continue;
+      int state = req->state.load(std::memory_order_acquire);
+      if (state != DPDK_REQ_SENDING && state != DPDK_REQ_RECEIVING)
+        continue;
+
+      bool hasAffectedTask = false;
+      if (state == DPDK_REQ_SENDING && req->send.tasks) {
+        for (int ti = 0; ti < req->numTasks && ti < 64; ti++) {
+          struct dpdkSendTask *task = req->send.tasks + ti;
+          if (!task->isDone && task->attachedDev == ev.failedDev) {
+            hasAffectedTask = true;
+            break;
+          }
+        }
+      } else if (state == DPDK_REQ_RECEIVING && req->recv.tasks) {
+        for (int ti = 0; ti < req->numTasks && ti < 64; ti++) {
+          struct dpdkRecvTask *task = req->recv.tasks + ti;
+          if (!task->isDone && task->attachedDev == ev.failedDev) {
+            hasAffectedTask = true;
+            break;
+          }
+        }
+      }
+      if (!hasAffectedTask)
+        continue;
+
+      if (backupDev < 0) {
+        WARN("NET/DPDK : no backup device found for failed dev %d",
+             ev.failedDev);
+        dpdkMarkRequestFailed(req, ncclSystemError);
+        continue;
+      }
+
+      INFO(NCCL_NET,
+           "NET/DPDK : handling local fault commId=%u remoteCommId=%u op=%s reqId=%u peerReqId=%u failedDev=%d backupDev=%d state=%d",
+           comm->commId, comm->remoteCommId, dpdkOpName(req->op), req->reqId,
+           req->peerReqId, ev.failedDev, backupDev, state);
+
+      uint64_t taskMask = 0;
+      ncclResult_t ret = ncclSuccess;
+      if (state == DPDK_REQ_SENDING && req->send.tasks) {
+        for (int ti = 0; ti < req->numTasks && ti < 64; ti++) {
+          struct dpdkSendTask *task = req->send.tasks + ti;
+          if (task->isDone || task->attachedDev != ev.failedDev)
+            continue;
+          ret = dpdkMigrateSendTaskLocal(req, task, backupDev);
+          if (ret != ncclSuccess)
+            break;
+          taskMask |= (1ull << ti);
+        }
+      } else if (state == DPDK_REQ_RECEIVING && req->recv.tasks) {
+        for (int ti = 0; ti < req->numTasks && ti < 64; ti++) {
+          struct dpdkRecvTask *task = req->recv.tasks + ti;
+          if (task->isDone || task->attachedDev != ev.failedDev)
+            continue;
+          ret = dpdkMigrateRecvTaskLocal(req, task, backupDev);
+          if (ret != ncclSuccess)
+            break;
+          taskMask |= (1ull << ti);
+        }
+      }
+
+      if (ret != ncclSuccess) {
+        WARN("NET/DPDK : task migration failed for reqId=%u", req->reqId);
+        dpdkMarkRequestFailed(req, ret);
+        continue;
+      }
+      if (taskMask == 0)
+        continue;
+
+      dpdkFaultMsg msg;
+      dpdkFillFaultMsg(comm, req, ev.failedDev, backupDev, taskMask, &msg);
+      if (!dpdkSendFaultMsg(comm, &msg)) {
+        WARN("NET/DPDK : failed to notify remote fault handler commId=%u",
+             comm->commId);
+        dpdkMarkRequestFailed(req, ncclRemoteError);
+      } else {
+        INFO(NCCL_NET,
+             "NET/DPDK : sent fault notify commId=%u remoteCommId=%u op=%s reqId=%u peerReqId=%u failedDev=%d backupDev=%d taskMask=0x%016llx",
+             comm->commId, comm->remoteCommId, dpdkOpName(req->op),
+             req->reqId, req->peerReqId, ev.failedDev, backupDev,
+             (unsigned long long)taskMask);
+      }
+    }
+  }
+  dpdkReleaseActiveComms(&comms);
+}
+
+static void dpdkFaultManagerMain() {
+  std::vector<dpdkFaultEvent> events;
+  std::vector<ncclNetDpdkComm *> comms;
+  int pollMs = ncclParamDpdkFaultManagerPollMs();
+  if (pollMs <= 0)
+    pollMs = 1;
+  while (!dpdkFaultStop.load(std::memory_order_acquire)) {
+    {
+      std::unique_lock<std::mutex> lock(dpdkFaultMutex);
+      dpdkFaultCv.wait_for(lock, std::chrono::milliseconds(pollMs), [] {
+        return dpdkFaultStop.load(std::memory_order_acquire) ||
+               !dpdkFaultEvents.empty();
+      });
+      events.swap(dpdkFaultEvents);
+    }
+
+    for (const auto &ev : events)
+      dpdkHandleLocalFaultEvent(ev);
+    events.clear();
+
+    dpdkCollectActiveComms(&comms);
+    for (auto *comm : comms)
+      dpdkProgressFaultRx(comm);
+    dpdkReleaseActiveComms(&comms);
+  }
+}
+
+static ncclResult_t dpdkStartFaultManager() {
+  if (dpdkFaultManagerRunning.load(std::memory_order_acquire))
+    return ncclSuccess;
+  dpdkFaultStop.store(0, std::memory_order_release);
+  try {
+    dpdkFaultManagerThread = std::thread(dpdkFaultManagerMain);
+  } catch (...) {
+    WARN("NET/DPDK : failed to start fault manager thread");
+    return ncclSystemError;
+  }
+  dpdkFaultManagerRunning.store(1, std::memory_order_release);
+  return ncclSuccess;
+}
+
+static void dpdkStopFaultManager() {
+  if (!dpdkFaultManagerRunning.load(std::memory_order_acquire))
+    return;
+  dpdkFaultStop.store(1, std::memory_order_release);
+  dpdkFaultCv.notify_all();
+  if (dpdkFaultManagerThread.joinable())
+    dpdkFaultManagerThread.join();
+  dpdkFaultManagerRunning.store(0, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(dpdkFaultMutex);
+    dpdkFaultEvents.clear();
+  }
+}
+
+static void dpdkRaiseLocalFaultEvent(int failedDev) {
+  if (failedDev < 0 || failedDev >= ncclNetDpdkIfs)
+    return;
+  {
+    std::lock_guard<std::mutex> lock(dpdkFaultMutex);
+    for (const auto &ev : dpdkFaultEvents) {
+      if (ev.failedDev == failedDev)
+        return;
+    }
+    dpdkFaultEvents.push_back({failedDev});
+  }
+  dpdkFaultCv.notify_one();
+}
+
 static ncclResult_t dpdkRegisterComm(struct ncclNetDpdkComm *comm) {
   std::lock_guard<std::mutex> lock(ncclNetDpdkCommMutex);
   dpdkActiveComms.push_back(comm);
@@ -2231,6 +2896,12 @@ static ncclResult_t dpdkStopPollThread(int dev) {
     thread->txDrops = 0;
     thread->rxPkts = 0;
     thread->lastLoadTsc = 0;
+    thread->lastLinkCheckTsc = 0;
+    thread->linkDownCount = 0;
+    thread->faultReported = 0;
+#if NCCL_DPDK_FAULT_INJECT
+    thread->lastFaultInjectTsc = 0;
+#endif
   }
   return ncclSuccess;
 }
@@ -2257,6 +2928,7 @@ ncclResult_t ncclNetDpdkInit(void **ctx, uint64_t commId,
   for (int d = 0; d < ncclNetDpdkIfs; d++) {
     NCCLCHECK(dpdkStartPollThread(d));
   }
+  NCCLCHECK(dpdkStartFaultManager());
   return ncclSuccess;
 }
 
@@ -2435,13 +3107,17 @@ ncclResult_t ncclNetDpdkConnect(void *ctx, int dev, void *opaqueHandle,
   struct ncclNetDpdkCommStage *stage = &handle->stage;
   struct ncclNetDpdkComm *comm = stage->comm;
 
-  // Non-blocking connect state machine:
-  // TCP connect -> send hello -> register communicator.
+  // Non-blocking dual-channel state machine:
+  // TCP(ctrl) -> hello(ctrl) -> TCP(fault) -> hello(fault) -> register.
   *sendComm = NULL;
-  if (stage->state == ncclNetDpdkCommStateConnect)
-    goto dpdk_connect_check;
-  if (stage->state == ncclNetDpdkCommStateHelloSend)
-    goto dpdk_hello_send;
+  if (stage->state == ncclNetDpdkCommStateConnectCtrl)
+    goto dpdk_connect_ctrl_check;
+  if (stage->state == ncclNetDpdkCommStateHelloSendCtrl)
+    goto dpdk_hello_ctrl_send;
+  if (stage->state == ncclNetDpdkCommStateConnectFault)
+    goto dpdk_connect_fault_check;
+  if (stage->state == ncclNetDpdkCommStateHelloSendFault)
+    goto dpdk_hello_fault_send;
 
   comm = new ncclNetDpdkComm();
   dpdkInitCommDefaults(comm);
@@ -2467,28 +3143,67 @@ ncclResult_t ncclNetDpdkConnect(void *ctx, int dev, void *opaqueHandle,
   NCCLCHECK(ncclSocketInit(&comm->ctrlSock, &handle->connectAddr, handle->magic,
                            ncclSocketTypeNetSocket, NULL, 1));
   stage->sock = &comm->ctrlSock;
-  stage->state = ncclNetDpdkCommStateConnect;
+  stage->state = ncclNetDpdkCommStateConnectCtrl;
   stage->ioOffset = 0;
+  stage->acceptedChannelMask = 0;
+  memset(&stage->hello, 0, sizeof(stage->hello));
   NCCLCHECK(ncclSocketConnect(&comm->ctrlSock));
 
-dpdk_connect_check:
+dpdk_connect_ctrl_check:
   NCCLCHECK(ncclSocketReady(stage->sock, &ready));
   if (!ready)
     return ncclSuccess;
-  stage->state = ncclNetDpdkCommStateHelloSend;
+  stage->state = ncclNetDpdkCommStateHelloSendCtrl;
   stage->ioOffset = 0;
 
-dpdk_hello_send:
-  dpdkHelloMsg hello;
-  hello.mac = comm->localMac;
-  hello.dataIp = comm->localIp;
-  hello.commId = comm->commId;
-  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND, stage->sock, &hello,
-                               sizeof(hello), &stage->ioOffset));
-  if (stage->ioOffset < (int)sizeof(hello))
+dpdk_hello_ctrl_send:
+  if (stage->ioOffset == 0) {
+    memset(&stage->hello, 0, sizeof(stage->hello));
+    stage->hello.mac = comm->localMac;
+    stage->hello.dataIp = comm->localIp;
+    stage->hello.commId = comm->commId;
+    stage->hello.channel = DPDK_HELLO_CHANNEL_CTRL;
+  }
+  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND, stage->sock, &stage->hello,
+                               sizeof(stage->hello), &stage->ioOffset));
+  if (stage->ioOffset < (int)sizeof(stage->hello))
     return ncclSuccess;
+
+  NCCLCHECK(ncclSocketInit(&comm->faultSock, &handle->connectAddr, handle->magic,
+                           ncclSocketTypeNetSocket, NULL, 1));
+  stage->sock = &comm->faultSock;
+  stage->state = ncclNetDpdkCommStateConnectFault;
+  stage->ioOffset = 0;
+  NCCLCHECK(ncclSocketConnect(&comm->faultSock));
+
+dpdk_connect_fault_check:
+  NCCLCHECK(ncclSocketReady(stage->sock, &ready));
+  if (!ready)
+    return ncclSuccess;
+  stage->state = ncclNetDpdkCommStateHelloSendFault;
+  stage->ioOffset = 0;
+
+dpdk_hello_fault_send:
+  if (stage->ioOffset == 0) {
+    memset(&stage->hello, 0, sizeof(stage->hello));
+    stage->hello.mac = comm->localMac;
+    stage->hello.dataIp = comm->localIp;
+    stage->hello.commId = comm->commId;
+    stage->hello.channel = DPDK_HELLO_CHANNEL_FAULT;
+  }
+  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND, stage->sock, &stage->hello,
+                               sizeof(stage->hello), &stage->ioOffset));
+  if (stage->ioOffset < (int)sizeof(stage->hello))
+    return ncclSuccess;
+
   NCCLCHECK(dpdkRegisterComm(comm));
   *sendComm = comm;
+  stage->state = ncclNetDpdkCommStateStart;
+  stage->sock = NULL;
+  stage->comm = NULL;
+  stage->ioOffset = 0;
+  stage->acceptedChannelMask = 0;
+  memset(&stage->hello, 0, sizeof(stage->hello));
   return ncclSuccess;
 }
 
@@ -2499,10 +3214,11 @@ ncclResult_t ncclNetDpdkAccept(void *listenComm, void **recvComm,
   struct ncclNetDpdkCommStage *stage = &lComm->stage;
   struct ncclNetDpdkComm *rComm = stage->comm;
   struct ncclSocket *sock = stage->sock;
+  ncclResult_t ret = ncclSuccess;
   int ready;
 
-  // Non-blocking accept state machine:
-  // accept socket -> receive hello -> register communicator.
+  // Non-blocking dual-channel accept:
+  // accept twice -> classify by hello.channel -> bind ctrl/fault sockets.
   *recvComm = NULL;
   if (stage->state == ncclNetDpdkCommStateAccept)
     goto dpdk_accept_check;
@@ -2520,40 +3236,115 @@ ncclResult_t ncclNetDpdkAccept(void *listenComm, void **recvComm,
   rComm->cudaDev = -1;
   rComm->localIp = ncclNetDpdkDevs[rComm->dev].addr.sin.sin_addr.s_addr;
   rte_ether_addr_copy(&ncclNetDpdkDevs[rComm->dev].mac, &rComm->localMac);
+  stage->acceptedChannelMask = 0;
+  memset(&stage->hello, 0, sizeof(stage->hello));
 
-  NCCLCHECK(ncclCalloc(&sock, 1));
-  NCCLCHECK(ncclSocketInit(sock));
+  NCCLCHECKGOTO(ncclCalloc(&sock, 1), ret, fail);
+  NCCLCHECKGOTO(ncclSocketInit(sock), ret, fail);
   stage->sock = sock;
   stage->state = ncclNetDpdkCommStateAccept;
   stage->ioOffset = 0;
-  NCCLCHECK(ncclSocketAccept(sock, &lComm->sock));
+  NCCLCHECKGOTO(ncclSocketAccept(sock, &lComm->sock), ret, fail);
 
 dpdk_accept_check:
-  NCCLCHECK(ncclSocketReady(stage->sock, &ready));
+  NCCLCHECKGOTO(ncclSocketReady(stage->sock, &ready), ret, fail);
   if (!ready)
     return ncclSuccess;
   stage->state = ncclNetDpdkCommStateHelloRecv;
   stage->ioOffset = 0;
+  memset(&stage->hello, 0, sizeof(stage->hello));
 
 dpdk_hello_recv:
-  dpdkHelloMsg hello;
-  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, stage->sock, &hello,
-                               sizeof(hello), &stage->ioOffset));
-  if (stage->ioOffset < (int)sizeof(hello))
+  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_RECV, stage->sock, &stage->hello,
+                                   sizeof(stage->hello), &stage->ioOffset),
+                ret, fail);
+  if (stage->ioOffset < (int)sizeof(stage->hello))
     return ncclSuccess;
-  rComm->remoteMac = hello.mac;
-  rComm->remoteIp = hello.dataIp;
-  rComm->remoteCommId = hello.commId;
-  rComm->ctrlSock = *sock;
+
+  if (stage->hello.channel != DPDK_HELLO_CHANNEL_CTRL &&
+      stage->hello.channel != DPDK_HELLO_CHANNEL_FAULT) {
+    WARN("NET/DPDK : invalid hello channel %u", stage->hello.channel);
+    ret = ncclInvalidUsage;
+    goto fail;
+  }
+
+  if (rComm->remoteCommId == 0) {
+    rComm->remoteCommId = stage->hello.commId;
+    rComm->remoteIp = stage->hello.dataIp;
+    rComm->remoteMac = stage->hello.mac;
+  } else if (rComm->remoteCommId != stage->hello.commId) {
+    WARN("NET/DPDK : mismatched hello commId %u != %u",
+         rComm->remoteCommId, stage->hello.commId);
+    ret = ncclInvalidUsage;
+    goto fail;
+  }
+
+  if (stage->hello.channel == DPDK_HELLO_CHANNEL_CTRL) {
+    if (stage->acceptedChannelMask & 0x1) {
+      WARN("NET/DPDK : duplicate ctrl channel accept");
+      ret = ncclInvalidUsage;
+      goto fail;
+    }
+    rComm->ctrlSock = *sock;
+    stage->acceptedChannelMask |= 0x1;
+  } else {
+    if (stage->acceptedChannelMask & 0x2) {
+      WARN("NET/DPDK : duplicate fault channel accept");
+      ret = ncclInvalidUsage;
+      goto fail;
+    }
+    rComm->faultSock = *sock;
+    stage->acceptedChannelMask |= 0x2;
+  }
   free(sock);
-  NCCLCHECK(dpdkRegisterComm(rComm));
+  sock = NULL;
+  stage->sock = NULL;
+
+  if (stage->acceptedChannelMask != 0x3) {
+    sock = NULL;
+    NCCLCHECKGOTO(ncclCalloc(&sock, 1), ret, fail);
+    NCCLCHECKGOTO(ncclSocketInit(sock), ret, fail);
+    stage->sock = sock;
+    stage->state = ncclNetDpdkCommStateAccept;
+    stage->ioOffset = 0;
+    NCCLCHECKGOTO(ncclSocketAccept(sock, &lComm->sock), ret, fail);
+    return ncclSuccess;
+  }
+
+  NCCLCHECKGOTO(dpdkRegisterComm(rComm), ret, fail);
   *recvComm = rComm;
 
   stage->state = ncclNetDpdkCommStateStart;
   stage->sock = NULL;
   stage->comm = NULL;
   stage->ioOffset = 0;
+  stage->acceptedChannelMask = 0;
+  memset(&stage->hello, 0, sizeof(stage->hello));
   return ncclSuccess;
+
+fail:
+  if (sock) {
+    (void)ncclSocketClose(sock);
+    free(sock);
+  }
+  if (stage->sock && stage->sock != sock) {
+    (void)ncclSocketClose(stage->sock);
+    free(stage->sock);
+  }
+  stage->sock = NULL;
+  if (stage->comm) {
+    if (stage->comm->ctrlSock.fd >= 0)
+      (void)ncclSocketClose(&stage->comm->ctrlSock);
+    if (stage->comm->faultSock.fd >= 0)
+      (void)ncclSocketClose(&stage->comm->faultSock);
+    delete stage->comm;
+    stage->comm = NULL;
+  }
+  stage->state = ncclNetDpdkCommStateStart;
+  stage->ioOffset = 0;
+  stage->acceptedChannelMask = 0;
+  memset(&stage->hello, 0, sizeof(stage->hello));
+  return ret;
 }
 
 ncclResult_t ncclNetDpdkRegMr(void *comm, void *data, size_t size, int type,
@@ -2603,6 +3394,13 @@ ncclResult_t ncclNetDpdkTest(void *request, int *done, int *size) {
   if (r == NULL) {
     WARN("NET/DPDK : test called with NULL request");
     return ncclInternalError;
+  }
+  int reqErr = r->errorCode.load(std::memory_order_acquire);
+  if (reqErr != 0) {
+    r->state.store(DPDK_REQ_UNUSED, std::memory_order_release);
+    dpdkDetachRequestTasks(r);
+    r->inUse = 0;
+    return (ncclResult_t)reqErr;
   }
   struct ncclNetDpdkComm *comm = r->comm;
 
@@ -2852,6 +3650,8 @@ ncclResult_t ncclNetDpdkClose(void *opaqueComm) {
     NCCLCHECK(ncclSocketReady(&comm->ctrlSock, &ready));
     if (ready)
       NCCLCHECK(ncclSocketClose(&comm->ctrlSock));
+    if (comm->faultSock.fd >= 0)
+      (void)ncclSocketClose(&comm->faultSock);
     dpdkCommRelease(comm);
   }
   return ncclSuccess;
@@ -2863,6 +3663,7 @@ ncclResult_t ncclNetDpdkFinalize(void *ctx) {
     return ncclSuccess;
   if (--dpdkInitRefCount > 0)
     return ncclSuccess;
+  dpdkStopFaultManager();
   for (int d = 0; d < ncclNetDpdkIfs; d++) {
     NCCLCHECK(dpdkStopPollThread(d));
   }

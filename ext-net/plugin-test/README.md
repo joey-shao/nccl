@@ -35,8 +35,8 @@ sudo -E ./build/nccl-net-plugin-receiver \
   --plugin ../dpdk/build/libnccl-net-dpdk.so \
   --net-conf ./net.conf \
   --dev 0 \
-  --task-bytes 1048576 \
-  --task-count 1 \
+  --task-bytes 1073741824 \
+  --task-count 2 \
   --timeout-ms 1000000 \
   --verbose
 
@@ -56,8 +56,8 @@ sudo -E ./build/nccl-net-plugin-sender \
   --plugin ../dpdk/build/libnccl-net-dpdk.so \
   --net-conf ./net.conf \
   --dev 0 \
-  --task-bytes 1048576 \
-  --task-count 1 \
+  --task-bytes 1073741824 \
+  --task-count 2 \
   --verbose
 
 ./build/nccl-net-plugin-sender \
@@ -105,3 +105,7 @@ Socket 测试只需要把插件类型改成 `socket`：
 - `--factor <n>`：调整每档大小倍数，默认 `4`。
 - `--task-count <count>`：每个 size 的 task 数。
 - `--out <path>`：结果日志路径。
+
+sudo -E mpirun --allow-run-as-root -np 2 -N 1 --host node0-ctrl,node1-ctrl -x LD_LIBRARY_PATH=/users/zwshao/nccl/build/lib:/usr/local/cuda-12.2/lib64  -x NCCL_DPDK_NET_CONF -x NCCL_DPDK_EAL -x NCCL_NET -x NCCL_NET_PLUGIN ./build/all_reduce_perf -b 64K -e 1G -f 4 -g 1
+
+sudo -E mpirun --allow-run-as-root -np 2 -N 1 --host node0,node1 -x LD_LIBRARY_PATH=/users/zwshao/nccl/build/lib:/usr/local/cuda-12.2/lib64  -x NCCL_NET=Socket ./build/all_reduce_perf -b 64K -e 1G -f 4 -g 1
